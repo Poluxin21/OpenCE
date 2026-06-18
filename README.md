@@ -19,6 +19,7 @@ procurar valores, alterá-los e injetar código — com foco em ser simples de u
 | **Busca** | First/Next scan em thread de fundo (com barra de progresso e cancelar). Tipos `i8`–`u64`, `f32`, `f64`. Comparações: valor exato, maior/menor, mudou, não mudou, aumentou, diminuiu. |
 | **Cheat Table** | Salva endereços, mostra o valor em tempo real, escreve e **congela** valores. |
 | **Pointer Scan** | Encontra cadeias de ponteiros estáveis (`["game.exe"+1A2B]+10+8`) que sempre levam ao endereço, mesmo após reiniciar o jogo — e as resolve dinamicamente. |
+| **Auto Assembler** | Scripts estilo Cheat Engine (`[ENABLE]`/`[DISABLE]`): `aobscanmodule`, `alloc` de code cave perto do alvo, `label`, `db`, `jmp`/`call`/`jmp64`, `dq`/`dd`, `dealloc`. Aplica e desfaz patches. |
 | **Injeção** | Lista módulos, AOB scan (com curinga `??`), patch de bytes, NOP e injeção de DLL (`LoadLibraryW` + `CreateRemoteThread`). |
 
 ## Por que pointer scan importa
@@ -73,16 +74,44 @@ src/
   value.rs     tipos de valor (parse/format)
   scan.rs      motor de busca (first/next scan)
   pointer.rs   pointer scanner (busca reversa de cadeias)
+  assembler.rs auto assembler (scripts de code cave / patch)
   inject.rs    módulos, AOB scan, patch/NOP, injeção de DLL
 ```
 
+## Auto Assembler
+
+Exemplo de script (god mode trocando a instrução que tira vida por um code cave):
+
+```
+[ENABLE]
+aobscanmodule(inject, jogo.exe, 89 83 A4 00 00 00)
+alloc(newmem, 0x1000, inject)
+
+newmem:
+  db 89 83 A4 00 00 00   // instrução original
+  jmp return
+
+inject:
+  jmp newmem
+  nop                    // completa o tamanho da instrução original
+return:
+
+[DISABLE]
+inject:
+  db 89 83 A4 00 00 00   // restaura os bytes originais
+dealloc(newmem)
+```
+
+Números: `0x..` ou `$..` = hex, sem prefixo = decimal. Para instruções que o
+montador não gera, use `db` com os bytes crus.
+
 ## Roadmap
 
-- [ ] Code cave / auto-assembler (alocar região, escrever código e desviar com `jmp`)
 - [ ] Salvar/carregar a cheat table em arquivo
 - [ ] Scan de "valor inicial desconhecido"
 - [ ] Suporte a ponteiros de 32-bit
 - [ ] AOB scan em thread de fundo
+- [ ] Montador completo de mnemônicos (hoje o Auto Assembler usa `db` + diretivas)
 
 ## Tecnologias
 

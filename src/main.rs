@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod assembler;
 mod inject;
 mod memory;
 mod pointer;
@@ -63,8 +64,31 @@ type FrozenTargets = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
 enum Tab {
     Busca,
     Pointer,
+    Assembler,
     Injecao,
 }
+
+const AA_TEMPLATE: &str = "\
+[ENABLE]
+// 1) ache a instrucao no modulo do jogo (use ?? como curinga)
+// aobscanmodule(inject, jogo.exe, 89 83 A4 00 00 00)
+// 2) aloque um code cave perto do alvo (saltos rel32 alcancam)
+// alloc(newmem, 0x1000, inject)
+//
+// newmem:
+//   db 89 83 A4 00 00 00   // instrucao original (mantenha o efeito desejado)
+//   jmp return
+//
+// inject:
+//   jmp newmem
+//   nop                    // complete o tamanho da instrucao original
+// return:
+
+[DISABLE]
+// inject:
+//   db 89 83 A4 00 00 00   // restaura os bytes originais
+// dealloc(newmem)
+";
 
 struct App {
     processes: Vec<ProcessInfo>,
@@ -96,6 +120,11 @@ struct App {
     ptr_align_text: String,
     ptr_results: Vec<PtrPath>,
     ptr_task: Option<PtrTask>,
+
+    // --- aba auto assembler ---
+    aa_script: String,
+    aa_state: assembler::AsmState,
+    aa_log: Vec<String>,
 
     // --- aba de injecao ---
     tab: Tab,
@@ -135,6 +164,9 @@ impl Default for App {
             ptr_align_text: "4".into(),
             ptr_results: Vec::new(),
             ptr_task: None,
+            aa_script: AA_TEMPLATE.to_string(),
+            aa_state: assembler::AsmState::new(),
+            aa_log: Vec::new(),
             tab: Tab::Busca,
             modules: Vec::new(),
             module_filter: String::new(),
@@ -430,6 +462,7 @@ impl eframe::App for App {
                 ui.separator();
                 ui.selectable_value(&mut self.tab, Tab::Busca, "Busca");
                 ui.selectable_value(&mut self.tab, Tab::Pointer, "Pointer Scan");
+                ui.selectable_value(&mut self.tab, Tab::Assembler, "Auto Assembler");
                 ui.selectable_value(&mut self.tab, Tab::Injecao, "Injeção");
             });
         });
@@ -448,6 +481,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Busca => self.scan_panel(ui),
             Tab::Pointer => self.pointer_panel(ui),
+            Tab::Assembler => self.assembler_panel(ui),
             Tab::Injecao => self.inject_panel(ui),
         });
     }
@@ -823,6 +857,79 @@ impl App {
             });
             self.status = "Cadeia adicionada à cheat table (endereço resolvido dinamicamente).".into();
         }
+    }
+
+    fn run_assembler(&mut self, section: assembler::Section) {
+        let Some(h) = self.attached.clone() else {
+            self.status = "Anexe um processo primeiro.".into();
+            return;
+        };
+        let name = if section == assembler::Section::Enable {
+            "Enable"
+        } else {
+            "Disable"
+        };
+        match assembler::run_section(h.raw(), h.pid, &self.aa_script, section, &mut self.aa_state) {
+            Ok(log) => {
+                self.status = format!("{name} executado ({} passos).", log.len());
+                self.aa_log = log;
+            }
+            Err(e) => {
+                self.status = format!("{name} falhou: {e}");
+                self.aa_log = vec![format!("ERRO: {e}")];
+            }
+        }
+    }
+
+    fn assembler_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Auto Assembler");
+        ui.label(
+            "Scripts estilo Cheat Engine: AOB scan, code cave (alloc), patch e restauração. \
+             Enable aplica, Disable desfaz.",
+        );
+
+        let enabled = self.attached.is_some();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(enabled, egui::Button::new("▶ Enable"))
+                .clicked()
+            {
+                self.run_assembler(assembler::Section::Enable);
+            }
+            if ui
+                .add_enabled(enabled, egui::Button::new("■ Disable"))
+                .clicked()
+            {
+                self.run_assembler(assembler::Section::Disable);
+            }
+            if ui.button("Restaurar template").clicked() {
+                self.aa_script = AA_TEMPLATE.to_string();
+            }
+        });
+
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_source("aa_editor")
+            .max_height(360.0)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.aa_script)
+                        .code_editor()
+                        .desired_rows(18)
+                        .desired_width(f32::INFINITY),
+                );
+            });
+
+        ui.separator();
+        ui.label("Log:");
+        egui::ScrollArea::vertical()
+            .id_source("aa_log")
+            .max_height(160.0)
+            .show(ui, |ui| {
+                for l in &self.aa_log {
+                    ui.monospace(l);
+                }
+            });
     }
 
     fn inject_panel(&mut self, ui: &mut egui::Ui) {
