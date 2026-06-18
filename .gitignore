@@ -1,0 +1,10 @@
+# Artefatos de build do Cargo
+/target/
+
+# Backtraces
+*.rs.bk
+
+# Arquivos do sistema
+Thumbs.db
+desktop.ini
+.DS_Store
