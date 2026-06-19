@@ -2,9 +2,12 @@
 //! code caves, escanear AOB, alocar memoria e aplicar/desfazer patches.
 //!
 //! Comandos suportados (uma instrucao por linha; `//` inicia comentario):
+//! Numeros (convencao Cheat Engine): sem prefixo = hex, `0x..`/`$..` = hex,
+//! `#..` = decimal, `(float)N`/`(double)N` = bits IEEE-754.
+//!
 //!   aobscanmodule(simbolo, modulo, AA BB ?? CC)
 //!   aobscan(simbolo, AA BB ?? CC)
-//!   alloc(simbolo, tamanho[, perto_de])      tamanho/numeros: 0x.. ou $ = hex, senao decimal
+//!   alloc(simbolo, tamanho[, perto_de])
 //!   label(nome)                              (declaracao opcional)
 //!   registersymbol(nome) / unregistersymbol(nome)
 //!   dealloc(simbolo)
@@ -15,8 +18,11 @@
 //!   nop [n]                                  escreve n bytes 0x90 (1 se omitido)
 //!   jmp <alvo> / call <alvo>                 salto/chamada relativo (rel32)
 //!   jmp64 <alvo>                             salto absoluto x64 (FF 25 + endereco)
+//!   <instrucao x86>                          mov/add/sub/cmp/lea/push/... (ver asm_x86)
 //!
 //! `<expr>` aceita `simbolo`, numero, ou `simbolo+0x10` / `endereco-8`.
+//! Linhas que nao casam com os comandos acima sao montadas como instrucao
+//! x86-64 pelo modulo `asm_x86` (ex: `mov [rbx+0x10], eax`).
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -26,6 +32,7 @@ use windows::Win32::System::Memory::{
     VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
 };
 
+use crate::asm_x86;
 use crate::inject::{self, ModuleInfo};
 use crate::memory::{self, Region};
 
@@ -58,6 +65,7 @@ enum Emit {
     JmpAbs(String),
     Dq(String),
     Dd(String),
+    Insn(asm_x86::Insn),
 }
 
 impl Emit {
@@ -69,6 +77,7 @@ impl Emit {
             Emit::JmpAbs(_) => 14,
             Emit::Dq(_) => 8,
             Emit::Dd(_) => 4,
+            Emit::Insn(i) => i.size(),
         }
     }
 
@@ -86,6 +95,13 @@ impl Emit {
             }
             Emit::Dq(t) => parse_expr(symbols, t)?.to_le_bytes().to_vec(),
             Emit::Dd(t) => (parse_expr(symbols, t)? as u32).to_le_bytes().to_vec(),
+            Emit::Insn(i) => {
+                let imm = match i.imm_text() {
+                    Some(t) => parse_expr(symbols, t)?,
+                    None => 0,
+                };
+                i.build(imm as i64)?
+            }
         })
     }
 }
@@ -112,23 +128,45 @@ enum Defer {
     Unregister(String),
 }
 
+/// Compara/remove um prefixo ignorando maiusculas/minusculas.
+fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// Convencao de numero estilo Cheat Engine (igual a de `asm_x86`):
+///   `(float)N`/`(double)N` -> bits IEEE-754 (32/64 bits)
+///   `#N` = decimal, `$N`/`0xN` = hex, `N` = hex (sem prefixo = hex)
 fn parse_num(tok: &str) -> Option<u64> {
     let t = tok.trim();
-    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+    if let Some(inner) = strip_ci(t, "(float)") {
+        return Some(inner.trim().parse::<f32>().ok()?.to_bits() as u64);
+    }
+    if let Some(inner) = strip_ci(t, "(double)") {
+        return Some(inner.trim().parse::<f64>().ok()?.to_bits());
+    }
+    if let Some(d) = t.strip_prefix('#') {
+        d.parse::<u64>().ok()
+    } else if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
         u64::from_str_radix(h, 16).ok()
     } else if let Some(h) = t.strip_prefix('$') {
         u64::from_str_radix(h, 16).ok()
     } else {
-        t.parse::<u64>().ok()
+        u64::from_str_radix(t, 16).ok()
     }
 }
 
 fn parse_operand(symbols: &HashMap<String, u64>, tok: &str) -> Result<u64, String> {
     let t = tok.trim();
-    if let Some(n) = parse_num(t) {
-        Ok(n)
-    } else if let Some(v) = symbols.get(t) {
+    // Simbolo antes de numero: com numero-hex-por-padrao, labels como `face`/`dead`
+    // seriam interpretados como hex se a busca de simbolo nao viesse primeiro.
+    if let Some(v) = symbols.get(t) {
         Ok(*v)
+    } else if let Some(n) = parse_num(t) {
+        Ok(n)
     } else {
         Err(format!("simbolo desconhecido: '{t}'"))
     }
@@ -136,6 +174,10 @@ fn parse_operand(symbols: &HashMap<String, u64>, tok: &str) -> Result<u64, Strin
 
 fn parse_expr(symbols: &HashMap<String, u64>, s: &str) -> Result<u64, String> {
     let s = s.trim();
+    // `(float)-1.0` contem um '-' que nao e um operador da expressao.
+    if strip_ci(s, "(float)").is_some() || strip_ci(s, "(double)").is_some() {
+        return parse_operand(symbols, s);
+    }
     for (i, ch) in s.char_indices() {
         if i > 0 && (ch == '+' || ch == '-') {
             let a = parse_operand(symbols, &s[..i])?;
@@ -354,7 +396,14 @@ pub fn run_section(
             "jmp64" => Emit::JmpAbs(rest.join("")),
             "dq" => Emit::Dq(rest.join("")),
             "dd" => Emit::Dd(rest.join("")),
-            other => return Err(format!("instrucao nao suportada: '{other}' (use db para bytes crus)")),
+            _ => match asm_x86::parse(line) {
+                Some(res) => Emit::Insn(res?),
+                None => {
+                    return Err(format!(
+                        "instrucao nao suportada: '{head}' (use db para bytes crus)"
+                    ))
+                }
+            },
         };
         items.push(Item::Emit(emit));
     }

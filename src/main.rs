@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod asm_x86;
 mod assembler;
 mod inject;
 mod memory;
@@ -87,19 +88,21 @@ const AA_TEMPLATE: &str = "\
 // aobscanmodule(inject, jogo.exe, 89 83 A4 00 00 00)
 // 2) aloque um code cave perto do alvo (saltos rel32 alcancam)
 // alloc(newmem, 0x1000, inject)
+// registersymbol(inject)
 //
 // newmem:
-//   db 89 83 A4 00 00 00   // instrucao original (mantenha o efeito desejado)
+//   mov [rbx+0x000000A4], 999   // forca o valor (ou escreva o efeito desejado)
 //   jmp return
 //
 // inject:
 //   jmp newmem
-//   nop                    // complete o tamanho da instrucao original
+//   nop                         // complete o tamanho da instrucao original
 // return:
 
 [DISABLE]
 // inject:
-//   db 89 83 A4 00 00 00   // restaura os bytes originais
+//   db 89 83 A4 00 00 00        // restaura os bytes originais
+// unregistersymbol(inject)
 // dealloc(newmem)
 ";
 
