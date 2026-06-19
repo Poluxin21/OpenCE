@@ -1,12 +1,23 @@
 [package]
-name = "opence"
+name = "quarry"
 version = "0.1.0"
 edition = "2021"
-description = "OpenCE - um scanner/editor de memoria open-source em Rust (estilo Cheat Engine)"
+description = "Quarry - analise de jogos/software: scanner de memoria + proxy de interceptacao HTTPS, em Rust"
 
 [dependencies]
 eframe = "0.28"
 egui = "0.28"
+
+# Proxy HTTPS de interceptacao (Kernel Exploring)
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server", "http1"] }
+http-body-util = "0.1"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "webpki-tokio", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.13"
+regex = "1"
 
 [dependencies.windows]
 version = "0.58"

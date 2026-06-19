@@ -13,6 +13,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # historico completo p/ montar o changelog
 
       - name: Instalar toolchain Rust
         uses: dtolnay/rust-toolchain@stable
@@ -26,17 +28,36 @@ jobs:
       - name: Publicar artefato do build
         uses: actions/upload-artifact@v4
         with:
-          name: opence-windows-x64
-          path: target/release/opence.exe
+          name: quarry-windows-x64
+          path: target/release/quarry.exe
 
-      # Atualiza uma release rolling "latest" a cada push na branch padrao.
-      - name: Atualizar release "latest"
+      # Cada push na branch padrao cria uma release NOVA (tag unica), sem
+      # sobrescrever as anteriores; a mais recente vira a "Latest".
+      - name: Criar nova release
         if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete latest --yes --cleanup-tag 2>$null
-          gh release create latest target/release/opence.exe `
-            --title "Build mais recente" `
-            --notes "Build automatica do commit ${{ github.sha }}." `
-            --prerelease
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $tag = "v$ver-build.${{ github.run_number }}"
+          $prev = git tag --list 'v*' --sort=-creatordate | Select-Object -First 1
+          if ($prev) { $range = "$prev..HEAD" } else { $range = "HEAD" }
+          $changes = (git log $range --pretty=format:'- %s (%h)') -join "`n"
+          if (-not $changes) { $changes = "- (sem novos commits desde $prev)" }
+          $notes = @"
+          **Quarry v$ver** — build ${{ github.run_number }} ($(Get-Date -Format yyyy-MM-dd))
+
+          ### Recursos
+          - **General Exploring**: scanner de memoria, pointer scan, auto assembler, injecao de DLL
+          - **Kernel Exploring**: proxy HTTPS (Historico, Intercept, Repeater, Match & Replace)
+          - Deteccao de anticheat + roteamento Kernel/General
+
+          ### Mudancas neste build
+          $changes
+          "@
+          $notes | Out-File -FilePath notes.md -Encoding utf8
+          gh release create $tag target/release/quarry.exe `
+            --target ${{ github.sha }} `
+            --title "Quarry v$ver (build ${{ github.run_number }})" `
+            --notes-file notes.md `
+            --latest

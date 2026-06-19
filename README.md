@@ -1,8 +1,10 @@
-# OpenCE
+# Quarry
 
-**Scanner e editor de memória open-source, em Rust, com interface gráfica.**
-Uma alternativa gratuita ao Cheat Engine para analisar a memória de um processo,
-procurar valores, alterá-los e injetar código — com foco em ser simples de usar.
+**Ferramenta de análise de jogos e software, em Rust, com interface gráfica.**
+Um "Burp Suite para software": scanner/editor de memória (estilo Cheat Engine)
+na seção **General Exploring**, e proxy de interceptação HTTPS — histórico,
+intercept, repeater e match & replace — na seção **Kernel Exploring** (que não
+toca no processo e funciona mesmo com anti-cheat kernel).
 
 > ⚠️ **Uso responsável.** Esta ferramenta é para jogos **single-player**, seus
 > próprios programas e estudo de engenharia reversa. **Não use em jogos online
@@ -26,7 +28,7 @@ procurar valores, alterá-los e injetar código — com foco em ser simples de u
 
 O endereço de um valor (ex: a vida) muda toda vez que o jogo é reaberto. O que
 **não** muda é o caminho de ponteiros, ancorado em um módulo do processo
-(`game.exe`, uma DLL). O OpenCE monta um mapa reverso de ponteiros e faz uma
+(`game.exe`, uma DLL). O Quarry monta um mapa reverso de ponteiros e faz uma
 busca a partir do alvo até encontrar uma âncora estática, gerando cadeias que
 funcionam de forma confiável entre execuções.
 
@@ -41,14 +43,14 @@ funcionam de forma confiável entre execuções.
 ## Compilar e rodar
 
 ```powershell
-git clone https://github.com/Poluxin21/opence.git
-cd opence
+git clone https://github.com/Poluxin21/quarry.git
+cd quarry
 cargo run --release
 ```
 
 Use `--release` para que a varredura de memória fique muito mais rápida.
 
-> Para anexar à maioria dos jogos é preciso rodar o OpenCE **como
+> Para anexar à maioria dos jogos é preciso rodar o Quarry **como
 > Administrador**.
 
 ## Como usar (exemplo rápido)
@@ -121,4 +123,7 @@ montador não gera, use `db` com os bytes crus.
 
 ## Licença
 
-[MIT](LICENSE)
+Source-available **proprietária** — o código é público para estudo, pesquisa de
+segurança e contribuição, mas a propriedade do Quarry é do autor (modelo
+semelhante ao Burp Suite). Veja [LICENSE](LICENSE). Uso somente contra alvos
+próprios ou autorizados.

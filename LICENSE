@@ -1,21 +1,47 @@
-MIT License
+Quarry License — Proprietary, Source-Available
+Copyright (c) 2026 Guilherme Bento (Poluxin21). All rights reserved.
 
-Copyright (c) 2026 Guilherme Bento ( Poluxin21 )
+Quarry is SOURCE-AVAILABLE but PROPRIETARY software. The source code is
+published for transparency, study, security research, and contribution. This
+is NOT free/libre or open-source software as defined by the OSI: all
+intellectual property rights in and to Quarry are owned and retained by
+Guilherme Bento ("the Owner"), in the same spirit as commercial tools such as
+Burp Suite whose source may be visible while the product remains proprietary.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. GRANT
+   Subject to this license, the Owner grants you a personal, non-exclusive,
+   non-transferable, revocable permission to:
+   (a) view and study the source code;
+   (b) compile and run the software for personal, educational, and AUTHORIZED
+       security-research purposes;
+   (c) submit contributions to the official project.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+2. RESTRICTIONS
+   Without the Owner's prior written permission, you may NOT:
+   (a) use the software or any derivative for commercial purposes;
+   (b) redistribute, sublicense, sell, or offer the software (in source or
+       binary form) or a hosted/SaaS version of it;
+   (c) create and distribute derivative works or forks as separate products;
+   (d) remove or alter this license, copyright, or attribution notices;
+   (e) relicense the software under any other terms.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+3. CONTRIBUTIONS
+   By submitting any contribution (code, docs, etc.) you grant the Owner a
+   perpetual, irrevocable, worldwide, royalty-free license to use, modify, and
+   relicense it as part of Quarry, and you confirm you have the right to do so.
+   Ownership of the project as a whole remains with the Owner.
+
+4. AUTHORIZED USE ONLY
+   Quarry is an offensive/defensive security and reverse-engineering tool. You
+   may use it ONLY against systems, software, and network traffic that you own
+   or that you are explicitly authorized to test (e.g., your own machines,
+   private servers you operate, or targets within the scope of an authorized
+   engagement or bug-bounty program). You are solely responsible for complying
+   with all applicable laws and third-party terms of service.
+
+5. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED. IN NO EVENT SHALL THE OWNER BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+   OTHER LIABILITY ARISING FROM THE USE OF THE SOFTWARE.
+
+For commercial licensing or any use beyond this grant, contact the Owner.

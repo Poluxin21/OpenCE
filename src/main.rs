@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anticheat;
 mod asm_x86;
 mod assembler;
 mod inject;
 mod memory;
 mod pointer;
 mod process;
+mod proxy;
 mod scan;
 mod value;
 
@@ -41,7 +43,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "OpenCE - Scanner de Memoria",
+        "Quarry",
         options,
         Box::new(|_cc| Ok(Box::<App>::default())),
     )
@@ -74,12 +76,43 @@ impl SavedEntry {
 /// Alvos congelados compartilhados com a thread de freeze.
 type FrozenTargets = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
 
+/// As duas grandes secoes de exploracao do Quarry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    /// Metodos safe que NAO tocam o processo — uso com AC kernel (Vanguard...).
+    Kernel,
+    /// Acesso direto ao processo (scan/patch/injecao) — sem AC kernel.
+    General,
+}
+
+/// Sub-visões da aba Proxy (espelham o Burp: histórico, intercept, repeater).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProxyView {
+    History,
+    Intercept,
+    Repeater,
+    Rules,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    // --- General Exploring (acessa o processo) ---
     Busca,
     Pointer,
     Assembler,
     Injecao,
+    // --- Kernel Exploring (safe, sem injecao) ---
+    Proxy,
+    KernelOverview,
+}
+
+impl Tab {
+    fn section(self) -> Section {
+        match self {
+            Tab::Busca | Tab::Pointer | Tab::Assembler | Tab::Injecao => Section::General,
+            Tab::Proxy | Tab::KernelOverview => Section::Kernel,
+        }
+    }
 }
 
 const AA_TEMPLATE: &str = "\
@@ -142,8 +175,37 @@ struct App {
     aa_state: assembler::AsmState,
     aa_log: Vec<String>,
 
-    // --- aba de injecao ---
+    // --- secoes / classificacao de anticheat ---
+    section: Section,
     tab: Tab,
+    /// classificacao do alvo (None = nada anexado ainda).
+    detection: Option<anticheat::Detection>,
+
+    // --- proxy HTTPS (Kernel Exploring) ---
+    proxy: Option<proxy::ProxyHandle>,
+    proxy_port_text: String,
+    proxy_view: ProxyView,
+    proxy_filter: String,
+    proxy_selected: Option<u64>,
+    // intercept: buffers do item em edição
+    icpt_id: Option<u64>,
+    icpt_headers: String,
+    icpt_body: String,
+    icpt_follow: bool,
+    // repeater
+    rep_method: String,
+    rep_url: String,
+    rep_headers: String,
+    rep_body: String,
+    rep_rx: Option<proxy::RepeaterRx>,
+    rep_busy: bool,
+    rep_status: u16,
+    rep_resp_headers: String,
+    rep_resp_body: String,
+    // match & replace
+    rules: Vec<proxy::Rule>,
+
+    // --- aba de injecao ---
     modules: Vec<inject::ModuleInfo>,
     module_filter: String,
     aob_text: String,
@@ -183,7 +245,28 @@ impl Default for App {
             aa_script: AA_TEMPLATE.to_string(),
             aa_state: assembler::AsmState::new(),
             aa_log: Vec::new(),
+            section: Section::General,
             tab: Tab::Busca,
+            detection: None,
+            proxy: None,
+            proxy_port_text: "8080".into(),
+            proxy_view: ProxyView::History,
+            proxy_filter: String::new(),
+            proxy_selected: None,
+            icpt_id: None,
+            icpt_headers: String::new(),
+            icpt_body: String::new(),
+            icpt_follow: false,
+            rep_method: "GET".into(),
+            rep_url: String::new(),
+            rep_headers: String::new(),
+            rep_body: String::new(),
+            rep_rx: None,
+            rep_busy: false,
+            rep_status: 0,
+            rep_resp_headers: String::new(),
+            rep_resp_body: String::new(),
+            rules: Vec::new(),
             modules: Vec::new(),
             module_filter: String::new(),
             aob_text: String::new(),
@@ -212,12 +295,57 @@ impl App {
                 self.attached_name = format!("{name} (pid {pid})");
                 self.scanner.reset();
                 self.refresh_module_bases(pid);
+                self.classify(pid, &name);
                 self.status = format!("Anexado em {name}.");
             }
             Err(e) => {
                 self.status = format!(
-                    "Falha ao anexar (pid {pid}): {e}. Rode o OpenCE como Administrador."
+                    "Falha ao anexar (pid {pid}): {e}. Rode o Quarry como Administrador."
                 );
+            }
+        }
+    }
+
+    /// Classifica o alvo (AC kernel / user-mode / sem protecao) e roteia
+    /// para a secao correta. Com AC kernel, forca a secao Kernel Exploring.
+    fn classify(&mut self, pid: u32, exe_name: &str) {
+        let modules = inject::list_modules(pid);
+        let det = anticheat::detect(exe_name, &modules);
+        if det.protection.blocks_injection() {
+            // alvo protegido por AC kernel: empurra para a aba safe.
+            self.section = Section::Kernel;
+            self.tab = Tab::KernelOverview;
+        } else {
+            self.section = Section::General;
+            self.tab = Tab::Busca;
+        }
+        self.detection = Some(det);
+    }
+
+    /// True quando a injecao/patch deve ficar bloqueada (AC kernel detectado).
+    fn injection_blocked(&self) -> bool {
+        self.detection
+            .as_ref()
+            .is_some_and(|d| d.protection.blocks_injection())
+    }
+
+    /// Recolhe a resposta do Repeater quando pronta (sem bloquear).
+    fn poll_repeater(&mut self) {
+        let Some(rx) = &mut self.rep_rx else {
+            return;
+        };
+        match proxy::poll_repeater(rx) {
+            proxy::RepeaterPoll::Pending => {}
+            proxy::RepeaterPoll::Done(r) => {
+                self.rep_status = r.status;
+                self.rep_resp_headers = r.headers;
+                self.rep_resp_body = r.body;
+                self.rep_busy = false;
+                self.rep_rx = None;
+            }
+            proxy::RepeaterPoll::Closed => {
+                self.rep_busy = false;
+                self.rep_rx = None;
             }
         }
     }
@@ -500,9 +628,12 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan_task();
         self.poll_ptr_task();
-        // repinta rapido durante a busca; devagar quando ocioso
+        self.poll_repeater();
+        // repinta rapido durante a busca; medio com o proxy ativo; devagar ocioso
         if self.scan_task.is_some() || self.ptr_task.is_some() {
             ctx.request_repaint_after(Duration::from_millis(60));
+        } else if self.proxy.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(150));
         } else {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -524,10 +655,49 @@ impl eframe::App for App {
                     ui.colored_label(egui::Color32::GRAY, "(sem processo)");
                 }
                 ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Busca, "Busca");
-                ui.selectable_value(&mut self.tab, Tab::Pointer, "Pointer Scan");
-                ui.selectable_value(&mut self.tab, Tab::Assembler, "Auto Assembler");
-                ui.selectable_value(&mut self.tab, Tab::Injecao, "Injeção");
+                self.protection_badge(ui);
+            });
+
+            ui.horizontal(|ui| {
+                // Seletor de secao. Mudar de secao ajusta a aba ativa.
+                if ui
+                    .selectable_label(self.section == Section::Kernel, "🛡 Kernel Exploring")
+                    .clicked()
+                {
+                    self.section = Section::Kernel;
+                    self.tab = Tab::KernelOverview;
+                }
+                let general_resp = ui.selectable_label(
+                    self.section == Section::General,
+                    "🔧 General Exploring",
+                );
+                if general_resp.clicked() {
+                    self.section = Section::General;
+                    if self.tab.section() != Section::General {
+                        self.tab = Tab::Busca;
+                    }
+                }
+                if self.injection_blocked() {
+                    general_resp.on_hover_text(
+                        "Anticheat kernel detectado — acesso direto ao processo bloqueado. \
+                         Use Kernel Exploring.",
+                    );
+                }
+            });
+
+            ui.separator();
+            ui.horizontal(|ui| match self.section {
+                Section::General => {
+                    ui.selectable_value(&mut self.tab, Tab::Busca, "Busca");
+                    ui.selectable_value(&mut self.tab, Tab::Pointer, "Pointer Scan");
+                    ui.selectable_value(&mut self.tab, Tab::Assembler, "Auto Assembler");
+                    ui.selectable_value(&mut self.tab, Tab::Injecao, "Injeção");
+                }
+                Section::Kernel => {
+                    ui.selectable_value(&mut self.tab, Tab::Proxy, "Proxy HTTPS");
+                    ui.selectable_value(&mut self.tab, Tab::KernelOverview, "Visão geral");
+                    ui.weak("Captura passiva · LCU  (em construção)");
+                }
             });
         });
 
@@ -547,6 +717,8 @@ impl eframe::App for App {
             Tab::Pointer => self.pointer_panel(ui),
             Tab::Assembler => self.assembler_panel(ui),
             Tab::Injecao => self.inject_panel(ui),
+            Tab::Proxy => self.proxy_panel(ui),
+            Tab::KernelOverview => self.kernel_panel(ui),
         });
     }
 }
@@ -978,6 +1150,18 @@ impl App {
 
     fn assembler_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Auto Assembler");
+        if self.injection_blocked() {
+            let name = self
+                .detection
+                .as_ref()
+                .and_then(|d| d.protection.ac_name())
+                .unwrap_or("anticheat kernel");
+            ui.colored_label(
+                egui::Color32::from_rgb(0xE0, 0x6C, 0x75),
+                format!("🛡 {name} detectado — patch de código bloqueado. Use Kernel Exploring."),
+            );
+            return;
+        }
         ui.label(
             "Scripts estilo Cheat Engine: AOB scan, code cave (alloc), patch e restauração. \
              Enable aplica, Disable desfaz.",
@@ -1027,12 +1211,535 @@ impl App {
             });
     }
 
+    /// Badge colorido no top bar com o resultado da classificacao de AC.
+    fn protection_badge(&self, ui: &mut egui::Ui) {
+        match self.detection.as_ref().map(|d| &d.protection) {
+            None => {
+                ui.colored_label(egui::Color32::GRAY, "Proteção: —");
+            }
+            Some(anticheat::Protection::KernelAc(name)) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xE0, 0x6C, 0x75),
+                    format!("🛡 AC kernel: {name} (injeção bloqueada)"),
+                );
+            }
+            Some(anticheat::Protection::UsermodeAc(name)) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xE5, 0xC0, 0x7B),
+                    format!("⚠ AC user-mode: {name}"),
+                );
+            }
+            Some(anticheat::Protection::Unprotected) => {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, "✔ Sem AC kernel");
+            }
+        }
+    }
+
+    /// Painel da secao Kernel Exploring: mostra a classificacao e os metodos
+    /// safe disponiveis (que nao tocam o processo protegido).
+    fn kernel_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("🛡 Kernel Exploring (safe)");
+        ui.label(
+            "Análise de alvos protegidos por anticheat kernel (Vanguard, EAC, BattlEye…) \
+             SEM injeção nem acesso ao processo — só métodos que respeitam o anticheat.",
+        );
+        ui.add_space(6.0);
+
+        ui.group(|ui| {
+            ui.strong("Classificação do alvo");
+            match self.detection.as_ref() {
+                None => {
+                    ui.label("Anexe um processo para classificar.");
+                }
+                Some(det) => {
+                    self.protection_badge(ui);
+                    if det.reasons.is_empty() {
+                        ui.weak("Nenhuma assinatura de anticheat encontrada.");
+                    } else {
+                        for r in &det.reasons {
+                            ui.weak(format!("• {r}"));
+                        }
+                    }
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.strong("Métodos disponíveis");
+        let method = |ui: &mut egui::Ui, name: &str, desc: &str, ready: bool| {
+            ui.horizontal(|ui| {
+                if ready {
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, "●");
+                } else {
+                    ui.colored_label(egui::Color32::GRAY, "○");
+                }
+                ui.strong(name);
+                ui.weak(if ready { "" } else { "(em construção)" });
+            });
+            ui.weak(desc);
+            ui.add_space(2.0);
+        };
+        method(
+            ui,
+            "Proxy HTTPS + CA própria",
+            "Intercepta as APIs web/plataforma (login, loja, matchmaking) em texto puro — \
+             estilo Burp, sem tocar no jogo.",
+            false,
+        );
+        method(
+            ui,
+            "Captura passiva (pcap)",
+            "Observa endpoints, portas, timing e volume na placa de rede. Conteúdo cifrado, \
+             mas ótimo para Threat Intel / mapeamento de infra.",
+            false,
+        );
+        method(
+            ui,
+            "API local do client (LCU)",
+            "Fala com a REST/WebSocket local do client (ex.: League) — acessível \
+             legitimamente, sem injeção.",
+            false,
+        );
+    }
+
+    fn proxy_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Proxy HTTPS");
+        ui.label(
+            "Intercepta, edita e reenvia requisições/respostas HTTP(S) — estilo Burp. Não toca \
+             no processo: funciona com qualquer alvo, inclusive sob anticheat kernel.",
+        );
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            let running = self.proxy.is_some();
+            ui.label("Porta:");
+            ui.add_enabled(
+                !running,
+                egui::TextEdit::singleline(&mut self.proxy_port_text).desired_width(70.0),
+            );
+            if !running {
+                if ui.button("▶ Iniciar").clicked() {
+                    match self.proxy_port_text.trim().parse::<u16>() {
+                        Ok(port) => {
+                            let p = proxy::start(port);
+                            p.shared.set_rules(self.rules.clone());
+                            self.proxy = Some(p);
+                            self.status = format!("Proxy iniciado na porta {port}.");
+                        }
+                        Err(_) => self.status = "Porta inválida.".into(),
+                    }
+                }
+            } else if ui.button("■ Parar").clicked() {
+                self.proxy = None; // Drop encerra o proxy
+                self.status = "Proxy parado.".into();
+            }
+            if let Some(p) = &self.proxy {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, p.status());
+            }
+        });
+
+        if let Some(p) = &self.proxy {
+            ui.horizontal(|ui| {
+                ui.label("CA:");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(p.ca_path.display().to_string()).monospace(),
+                    )
+                    .selectable(true),
+                );
+            });
+            ui.weak(
+                "Instale esse arquivo como Autoridade Certificadora Raiz confiável e aponte o \
+                 proxy do sistema/jogo para 127.0.0.1 na porta acima para ver HTTPS.",
+            );
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.proxy_view, ProxyView::History, "Histórico");
+            let pending = self.proxy.as_ref().map(|p| p.shared.pending_count()).unwrap_or(0);
+            let label = if pending > 0 {
+                format!("Intercept ({pending})")
+            } else {
+                "Intercept".to_string()
+            };
+            ui.selectable_value(&mut self.proxy_view, ProxyView::Intercept, label);
+            ui.selectable_value(&mut self.proxy_view, ProxyView::Repeater, "Repeater");
+            ui.selectable_value(&mut self.proxy_view, ProxyView::Rules, "Match & Replace");
+        });
+        ui.separator();
+
+        match self.proxy_view {
+            ProxyView::History => self.proxy_history(ui),
+            ProxyView::Intercept => self.proxy_intercept(ui),
+            ProxyView::Repeater => self.proxy_repeater(ui),
+            ProxyView::Rules => self.proxy_rules(ui),
+        }
+    }
+
+    fn proxy_history(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Filtro:");
+            ui.text_edit_singleline(&mut self.proxy_filter);
+            if ui.button("Limpar histórico").clicked() {
+                if let Some(p) = &self.proxy {
+                    p.shared.flows.lock().unwrap().clear();
+                }
+                self.proxy_selected = None;
+            }
+        });
+
+        let flows: Vec<proxy::FlowRecord> = self
+            .proxy
+            .as_ref()
+            .map(|p| p.shared.flows.lock().unwrap().clone())
+            .unwrap_or_default();
+        let filter = self.proxy_filter.to_lowercase();
+        ui.label(format!("{} flows", flows.len()));
+
+        egui::ScrollArea::vertical()
+            .id_source("proxy_flows")
+            .max_height(220.0)
+            .show(ui, |ui| {
+                egui::Grid::new("proxy_grid")
+                    .striped(true)
+                    .num_columns(4)
+                    .show(ui, |ui| {
+                        ui.strong("#");
+                        ui.strong("Método");
+                        ui.strong("Status");
+                        ui.strong("URL");
+                        ui.end_row();
+                        for f in flows.iter().rev() {
+                            if !filter.is_empty() && !f.url.to_lowercase().contains(&filter) {
+                                continue;
+                            }
+                            let sel = self.proxy_selected == Some(f.id);
+                            if ui.selectable_label(sel, f.id.to_string()).clicked() {
+                                self.proxy_selected = Some(f.id);
+                            }
+                            ui.label(&f.method);
+                            ui.label(if f.status == 0 {
+                                "—".to_string()
+                            } else {
+                                f.status.to_string()
+                            });
+                            ui.label(&f.url);
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        let selected = self
+            .proxy_selected
+            .and_then(|id| flows.iter().find(|f| f.id == id).cloned());
+        if let Some(f) = selected {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.strong(format!(
+                    "{} {}  →  {}  ({} B req / {} B resp)",
+                    f.method, f.url, f.status, f.req_len, f.resp_len
+                ));
+                if ui.button("→ Repeater").clicked() {
+                    self.rep_method = f.method.clone();
+                    self.rep_url = f.url.clone();
+                    self.rep_headers = f.req_headers.clone();
+                    self.rep_body = f.req_body.clone();
+                    self.proxy_view = ProxyView::Repeater;
+                }
+            });
+            egui::ScrollArea::vertical()
+                .id_source("proxy_detail")
+                .show(ui, |ui| {
+                    ui.collapsing("Requisição", |ui| {
+                        ui.monospace(&f.req_headers);
+                        if !f.req_body.is_empty() {
+                            ui.separator();
+                            ui.monospace(&f.req_body);
+                        }
+                    });
+                    ui.collapsing("Resposta", |ui| {
+                        ui.monospace(&f.resp_headers);
+                        if !f.resp_body.is_empty() {
+                            ui.separator();
+                            ui.monospace(&f.resp_body);
+                        }
+                    });
+                });
+        }
+    }
+
+    fn proxy_intercept(&mut self, ui: &mut egui::Ui) {
+        let Some(shared) = self.proxy.as_ref().map(|p| p.shared.clone()) else {
+            ui.weak("Inicie o proxy para interceptar.");
+            return;
+        };
+
+        let mut on = shared.intercept_on();
+        if ui
+            .checkbox(&mut on, "Interceptar (pausar requisições antes de enviar)")
+            .changed()
+        {
+            shared.set_intercept(on);
+        }
+        ui.separator();
+
+        let Some(view) = shared.first_pending() else {
+            ui.weak(if on {
+                "Aguardando requisição…"
+            } else {
+                "Intercept desligado."
+            });
+            return;
+        };
+
+        // Carrega os buffers editáveis quando chega um item novo.
+        if self.icpt_id != Some(view.id) {
+            self.icpt_id = Some(view.id);
+            self.icpt_headers = view.headers.clone();
+            self.icpt_body = view.body.clone();
+            self.icpt_follow = false;
+        }
+
+        let is_req = view.kind == proxy::InterceptKind::Request;
+        ui.strong(format!(
+            "{} — {} {}",
+            if is_req { "Requisição" } else { "Resposta" },
+            view.method,
+            view.url
+        ));
+        if !is_req {
+            ui.label(format!("Status {}", view.status));
+        }
+
+        ui.label("Headers:");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.icpt_headers)
+                .code_editor()
+                .desired_rows(5)
+                .desired_width(f32::INFINITY),
+        );
+        ui.label("Body:");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.icpt_body)
+                .code_editor()
+                .desired_rows(8)
+                .desired_width(f32::INFINITY),
+        );
+        if is_req {
+            ui.checkbox(&mut self.icpt_follow, "Interceptar a resposta também");
+        }
+
+        let mut forward = false;
+        let mut forward_follow = false;
+        let mut drop = false;
+        let mut to_repeater = false;
+        ui.horizontal(|ui| {
+            let fwd = ui.button("▶ Forward");
+            if is_req {
+                fwd.context_menu(|ui| {
+                    if ui.button("Forward interceptando a resposta").clicked() {
+                        forward_follow = true;
+                        ui.close_menu();
+                    }
+                });
+            }
+            if fwd.clicked() {
+                forward = true;
+            }
+            if ui.button("✖ Drop").clicked() {
+                drop = true;
+            }
+            if is_req && ui.button("→ Repeater").clicked() {
+                to_repeater = true;
+            }
+        });
+
+        if forward || forward_follow {
+            shared.resolve(
+                view.id,
+                proxy::Decision::Forward {
+                    headers: self.icpt_headers.clone(),
+                    body: self.icpt_body.clone(),
+                    intercept_response: self.icpt_follow || forward_follow,
+                },
+            );
+            self.icpt_id = None;
+        } else if drop {
+            shared.resolve(view.id, proxy::Decision::Drop);
+            self.icpt_id = None;
+        }
+        if to_repeater {
+            self.rep_method = view.method.clone();
+            self.rep_url = view.url.clone();
+            self.rep_headers = self.icpt_headers.clone();
+            self.rep_body = self.icpt_body.clone();
+            self.proxy_view = ProxyView::Repeater;
+        }
+    }
+
+    fn proxy_repeater(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Método:");
+            ui.add(egui::TextEdit::singleline(&mut self.rep_method).desired_width(70.0));
+            ui.label("URL:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.rep_url).desired_width(f32::INFINITY),
+            );
+        });
+        ui.label("Headers:");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.rep_headers)
+                .code_editor()
+                .desired_rows(5)
+                .desired_width(f32::INFINITY),
+        );
+        ui.label("Body:");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.rep_body)
+                .code_editor()
+                .desired_rows(5)
+                .desired_width(f32::INFINITY),
+        );
+
+        ui.horizontal(|ui| {
+            let can = self.proxy.is_some() && !self.rep_busy;
+            if ui.add_enabled(can, egui::Button::new("▶ Enviar")).clicked() {
+                let rx = self.proxy.as_ref().map(|p| {
+                    p.repeater(
+                        self.rep_method.clone(),
+                        self.rep_url.clone(),
+                        self.rep_headers.clone(),
+                        self.rep_body.clone(),
+                    )
+                });
+                if let Some(rx) = rx {
+                    self.rep_rx = Some(rx);
+                    self.rep_busy = true;
+                }
+            }
+            if self.proxy.is_none() {
+                ui.weak("(inicie o proxy para usar o Repeater)");
+            }
+            if self.rep_busy {
+                ui.spinner();
+                ui.label("enviando…");
+            }
+        });
+
+        ui.separator();
+        ui.strong(format!(
+            "Resposta: {}",
+            if self.rep_status == 0 {
+                "—".to_string()
+            } else {
+                self.rep_status.to_string()
+            }
+        ));
+        egui::ScrollArea::vertical()
+            .id_source("rep_resp")
+            .show(ui, |ui| {
+                if !self.rep_resp_headers.is_empty() {
+                    ui.monospace(&self.rep_resp_headers);
+                    ui.separator();
+                }
+                if !self.rep_resp_body.is_empty() {
+                    ui.monospace(&self.rep_resp_body);
+                }
+            });
+    }
+
+    fn proxy_rules(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            "Regras aplicadas automaticamente a toda mensagem (ex.: trocar dano=10 por \
+             dano=9999). Substring ou regex.",
+        );
+        if ui.button("+ Nova regra").clicked() {
+            self.rules.push(proxy::Rule {
+                enabled: true,
+                target: proxy::RuleTarget::RequestBody,
+                is_regex: false,
+                pattern: String::new(),
+                replacement: String::new(),
+            });
+        }
+        ui.separator();
+
+        let mut remove: Option<usize> = None;
+        egui::ScrollArea::vertical()
+            .id_source("rules")
+            .show(ui, |ui| {
+                for (i, r) in self.rules.iter_mut().enumerate() {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut r.enabled, "ativa");
+                            egui::ComboBox::from_id_source(format!("rt{i}"))
+                                .selected_text(r.target.label())
+                                .show_ui(ui, |ui| {
+                                    for t in proxy::RuleTarget::ALL {
+                                        ui.selectable_value(&mut r.target, t, t.label());
+                                    }
+                                });
+                            ui.checkbox(&mut r.is_regex, "regex");
+                            if ui.small_button("x").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Match:  ");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut r.pattern)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Replace:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut r.replacement)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    });
+                }
+            });
+        if let Some(i) = remove {
+            self.rules.remove(i);
+        }
+
+        // Sincroniza as regras com o runtime do proxy.
+        if let Some(p) = &self.proxy {
+            p.shared.set_rules(self.rules.clone());
+        }
+    }
+
     fn inject_panel(&mut self, ui: &mut egui::Ui) {
         let Some(h) = self.attached.clone() else {
             ui.heading("Injeção");
             ui.label("Anexe um processo primeiro (botão acima).");
             return;
         };
+        // Trava de seguranca: com AC kernel, nao oferecemos injecao/patch.
+        if self.injection_blocked() {
+            ui.heading("Injeção");
+            let name = self
+                .detection
+                .as_ref()
+                .and_then(|d| d.protection.ac_name())
+                .unwrap_or("anticheat kernel");
+            ui.colored_label(
+                egui::Color32::from_rgb(0xE0, 0x6C, 0x75),
+                format!("🛡 {name} detectado — injeção e patch bloqueados."),
+            );
+            ui.label(
+                "Injetar ou modificar este processo seria detectado/banido e foge do escopo \
+                 da ferramenta. Use a seção Kernel Exploring para análise safe.",
+            );
+            if ui.button("Ir para Kernel Exploring").clicked() {
+                self.section = Section::Kernel;
+                self.tab = Tab::KernelOverview;
+            }
+            return;
+        }
         let pid = h.pid;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
