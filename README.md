@@ -6,7 +6,7 @@ na seção **General Exploring**, e proxy de interceptação HTTPS — históric
 intercept, repeater e match & replace — na seção **Kernel Exploring** (que não
 toca no processo e funciona mesmo com anti-cheat kernel).
 
-> ⚠️ **Uso responsável.** Esta ferramenta é para jogos **single-player**, seus
+> ⚠️ **Uso responsável.** Esta ferramenta é para jogos **Que autorizam analise profunda**, seus
 > próprios programas e estudo de engenharia reversa. **Não use em jogos online
 > ou competitivos** com anti-cheat (BattlEye, EAC, VAC, etc.): além de violar os
 > termos de uso e resultar em banimento, esses sistemas protegem o processo e
