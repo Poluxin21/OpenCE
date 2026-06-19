@@ -7,10 +7,17 @@ on:
 
 permissions:
   contents: write
+  id-token: write # OIDC para a atestacao de proveniencia (gh attest)
+  attestations: write
 
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Segredos OPCIONAIS de assinatura Authenticode. Se ausentes, o passo de
+      # assinatura e pulado (nao quebra o build).
+      CODESIGN_PFX: ${{ secrets.CODESIGN_PFX_BASE64 }}
+      CODESIGN_PWD: ${{ secrets.CODESIGN_PWD }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,6 +37,32 @@ jobs:
         with:
           name: quarry-windows-x64
           path: target/release/quarry.exe
+
+      # Assinatura Authenticode (opcional): so roda se o certificado estiver
+      # nos secrets. Assina o binario oficial para ser verificavel/distinguivel.
+      - name: Assinar binario (Authenticode, opcional)
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && env.CODESIGN_PFX != ''
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:CODESIGN_PFX))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName | Select-Object -Last 1
+          & $signtool.FullName sign /fd SHA256 /f "$env:RUNNER_TEMP\cert.pfx" /p "$env:CODESIGN_PWD" `
+            /tr http://timestamp.digicert.com /td SHA256 target/release/quarry.exe
+          Remove-Item "$env:RUNNER_TEMP\cert.pfx"
+
+      # Proveniencia SLSA (keyless, via OIDC). Verificavel com:
+      #   gh attest verify quarry.exe --owner <dono-do-repo>
+      - name: Atestar proveniencia do build
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: target/release/quarry.exe
+
+      - name: Gerar checksum SHA256
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        run: |
+          $h = (Get-FileHash target/release/quarry.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  quarry.exe" | Out-File -FilePath target/release/quarry.exe.sha256 -Encoding ascii
 
       # Cada push na branch padrao cria uma release NOVA (tag unica), sem
       # sobrescrever as anteriores; a mais recente vira a "Latest".
@@ -54,9 +87,13 @@ jobs:
 
           ### Mudancas neste build
           $changes
+
+          ### Verificacao
+          - Proveniencia (SLSA): ``gh attest verify quarry.exe --owner ${{ github.repository_owner }}``
+          - Checksum: confira ``quarry.exe`` contra ``quarry.exe.sha256``
           "@
           $notes | Out-File -FilePath notes.md -Encoding utf8
-          gh release create $tag target/release/quarry.exe `
+          gh release create $tag target/release/quarry.exe target/release/quarry.exe.sha256 `
             --target ${{ github.sha }} `
             --title "Quarry v$ver (build ${{ github.run_number }})" `
             --notes-file notes.md `
