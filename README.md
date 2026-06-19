@@ -7,7 +7,7 @@ intercept, repeater e match & replace — na seção **Kernel Exploring** (que n
 toca no processo e funciona mesmo com anti-cheat kernel).
 
 > ⚠️ **Uso responsável.** Esta ferramenta é para jogos **Que autorizam analise profunda**, seus
-> próprios programas e estudo de engenharia reversa. **Não use em jogos online
+> próprios programas e estudo de engenharia reversa. **Não use o modo General Exploration em jogos online
 > ou competitivos** com anti-cheat (BattlEye, EAC, VAC, etc.): além de violar os
 > termos de uso e resultar em banimento, esses sistemas protegem o processo e
 > podem travar a aplicação. Use por sua conta e risco.
