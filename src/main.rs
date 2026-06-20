@@ -3,7 +3,9 @@
 mod anticheat;
 mod asm_x86;
 mod assembler;
+mod capture;
 mod inject;
+mod lcu;
 mod memory;
 mod pointer;
 mod process;
@@ -103,6 +105,8 @@ enum Tab {
     Injecao,
     // --- Kernel Exploring (safe, sem injecao) ---
     Proxy,
+    Capture,
+    Lcu,
     KernelOverview,
 }
 
@@ -110,7 +114,7 @@ impl Tab {
     fn section(self) -> Section {
         match self {
             Tab::Busca | Tab::Pointer | Tab::Assembler | Tab::Injecao => Section::General,
-            Tab::Proxy | Tab::KernelOverview => Section::Kernel,
+            Tab::Proxy | Tab::Capture | Tab::Lcu | Tab::KernelOverview => Section::Kernel,
         }
     }
 }
@@ -205,6 +209,21 @@ struct App {
     // match & replace
     rules: Vec<proxy::Rule>,
 
+    // --- captura passiva (Kernel Exploring) ---
+    capture: Option<capture::CaptureHandle>,
+    capture_iface: String,
+    capture_filter: String,
+
+    // --- API local do client / LCU (Kernel Exploring) ---
+    lcu_conn: Option<lcu::LcuConn>,
+    lcu_method: String,
+    lcu_path: String,
+    lcu_body: String,
+    lcu_rx: Option<lcu::LcuRx>,
+    lcu_busy: bool,
+    lcu_status: u16,
+    lcu_resp: String,
+
     // --- aba de injecao ---
     modules: Vec<inject::ModuleInfo>,
     module_filter: String,
@@ -267,6 +286,19 @@ impl Default for App {
             rep_resp_headers: String::new(),
             rep_resp_body: String::new(),
             rules: Vec::new(),
+            capture: None,
+            capture_iface: capture::primary_ipv4()
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            capture_filter: String::new(),
+            lcu_conn: None,
+            lcu_method: "GET".into(),
+            lcu_path: "/lol-summoner/v1/current-summoner".into(),
+            lcu_body: String::new(),
+            lcu_rx: None,
+            lcu_busy: false,
+            lcu_status: 0,
+            lcu_resp: String::new(),
             modules: Vec::new(),
             module_filter: String::new(),
             aob_text: String::new(),
@@ -283,6 +315,22 @@ impl Default for App {
 fn parse_addr(text: &str) -> Option<u64> {
     let t = text.trim().trim_start_matches("0x").trim_start_matches("0X");
     u64::from_str_radix(t, 16).ok()
+}
+
+/// Formata um numero de bytes em B/KB/MB/GB.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
 }
 
 impl App {
@@ -346,6 +394,31 @@ impl App {
             proxy::RepeaterPoll::Closed => {
                 self.rep_busy = false;
                 self.rep_rx = None;
+            }
+        }
+    }
+
+    fn poll_lcu(&mut self) {
+        let Some(rx) = &mut self.lcu_rx else {
+            return;
+        };
+        match lcu::poll(rx) {
+            lcu::LcuPoll::Pending => {}
+            lcu::LcuPoll::Done(Ok(r)) => {
+                self.lcu_status = r.status;
+                self.lcu_resp = r.body;
+                self.lcu_busy = false;
+                self.lcu_rx = None;
+            }
+            lcu::LcuPoll::Done(Err(e)) => {
+                self.lcu_status = 0;
+                self.lcu_resp = e;
+                self.lcu_busy = false;
+                self.lcu_rx = None;
+            }
+            lcu::LcuPoll::Closed => {
+                self.lcu_busy = false;
+                self.lcu_rx = None;
             }
         }
     }
@@ -629,10 +702,14 @@ impl eframe::App for App {
         self.poll_scan_task();
         self.poll_ptr_task();
         self.poll_repeater();
-        // repinta rapido durante a busca; medio com o proxy ativo; devagar ocioso
+        self.poll_lcu();
+        // repinta rapido durante a busca; medio com proxy/captura/lcu ativos; devagar ocioso
         if self.scan_task.is_some() || self.ptr_task.is_some() {
             ctx.request_repaint_after(Duration::from_millis(60));
-        } else if self.proxy.is_some() {
+        } else if self.proxy.is_some()
+            || self.capture.is_some()
+            || self.lcu_busy
+        {
             ctx.request_repaint_after(Duration::from_millis(150));
         } else {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -695,8 +772,8 @@ impl eframe::App for App {
                 }
                 Section::Kernel => {
                     ui.selectable_value(&mut self.tab, Tab::Proxy, "Proxy HTTPS");
+                    ui.selectable_value(&mut self.tab, Tab::Capture, "Captura passiva");
                     ui.selectable_value(&mut self.tab, Tab::KernelOverview, "Visão geral");
-                    ui.weak("Captura passiva · LCU  (em construção)");
                 }
             });
         });
@@ -718,6 +795,8 @@ impl eframe::App for App {
             Tab::Assembler => self.assembler_panel(ui),
             Tab::Injecao => self.inject_panel(ui),
             Tab::Proxy => self.proxy_panel(ui),
+            Tab::Capture => self.capture_panel(ui),
+            Tab::Lcu => self.lcu_panel(ui),
             Tab::KernelOverview => self.kernel_panel(ui),
         });
     }
@@ -1266,15 +1345,13 @@ impl App {
 
         ui.add_space(6.0);
         ui.strong("Métodos disponíveis");
-        let method = |ui: &mut egui::Ui, name: &str, desc: &str, ready: bool| {
+        let mut goto: Option<Tab> = None;
+        let mut method = |ui: &mut egui::Ui, name: &str, desc: &str, tab: Tab| {
             ui.horizontal(|ui| {
-                if ready {
-                    ui.colored_label(egui::Color32::LIGHT_GREEN, "●");
-                } else {
-                    ui.colored_label(egui::Color32::GRAY, "○");
+                ui.colored_label(egui::Color32::LIGHT_GREEN, "●");
+                if ui.link(egui::RichText::new(name).strong()).clicked() {
+                    goto = Some(tab);
                 }
-                ui.strong(name);
-                ui.weak(if ready { "" } else { "(em construção)" });
             });
             ui.weak(desc);
             ui.add_space(2.0);
@@ -1284,22 +1361,288 @@ impl App {
             "Proxy HTTPS + CA própria",
             "Intercepta as APIs web/plataforma (login, loja, matchmaking) em texto puro — \
              estilo Burp, sem tocar no jogo.",
-            false,
+            Tab::Proxy,
         );
         method(
             ui,
-            "Captura passiva (pcap)",
+            "Captura passiva (raw socket)",
             "Observa endpoints, portas, timing e volume na placa de rede. Conteúdo cifrado, \
              mas ótimo para Threat Intel / mapeamento de infra.",
-            false,
+            Tab::Capture,
         );
-        method(
-            ui,
-            "API local do client (LCU)",
-            "Fala com a REST/WebSocket local do client (ex.: League) — acessível \
-             legitimamente, sem injeção.",
-            false,
+
+        ui.add_space(10.0);
+        ui.group(|ui| {
+            ui.strong("🎮 Jogos nativos suportados");
+            ui.weak(
+                "Clientes com integração dedicada: o Quarry detecta o processo e fala com a \
+                 API local do jogo — legítimo, sem injeção nem leitura de memória.",
+            );
+            ui.add_space(6.0);
+
+            // League of Legends — API local do client (LCU).
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::from_rgb(0x1e, 0x90, 0xff), "●");
+                ui.strong("League of Legends");
+                match &self.lcu_conn {
+                    Some(c) => {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_GREEN,
+                            format!("client selecionado · pid {} · 127.0.0.1:{}", c.pid, c.port),
+                        );
+                    }
+                    None => {
+                        ui.colored_label(egui::Color32::GRAY, "client não detectado");
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("🔍 Detectar e selecionar").clicked() {
+                    match lcu::discover() {
+                        Ok(conn) => {
+                            self.status = format!(
+                                "League Client detectado (pid {}, porta {}).",
+                                conn.pid, conn.port
+                            );
+                            self.lcu_conn = Some(conn);
+                            goto = Some(Tab::Lcu);
+                        }
+                        Err(e) => {
+                            self.lcu_conn = None;
+                            self.status = format!("LCU: {e}");
+                        }
+                    }
+                }
+                if self.lcu_conn.is_some() && ui.button("Abrir API local ▸").clicked() {
+                    goto = Some(Tab::Lcu);
+                }
+            });
+        });
+
+        if let Some(tab) = goto {
+            self.tab = tab;
+        }
+    }
+
+    fn capture_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Captura passiva");
+        ui.label(
+            "Observa o tráfego IPv4 da placa de rede (raw socket promíscuo) e agrega por \
+             endpoint. Só metadados — IPs, portas, protocolo, volume e timing; o conteúdo \
+             é cifrado. Não toca no processo: seguro sob anticheat kernel.",
         );
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            let running = self.capture.is_some();
+            ui.label("Interface (IPv4):");
+            ui.add_enabled(
+                !running,
+                egui::TextEdit::singleline(&mut self.capture_iface).desired_width(140.0),
+            );
+            if !running {
+                if ui.button("▶ Iniciar").clicked() {
+                    match self.capture_iface.trim().parse::<std::net::Ipv4Addr>() {
+                        Ok(ip) => {
+                            self.capture = Some(capture::start(ip));
+                            self.status = format!("Captura iniciada em {ip}.");
+                        }
+                        Err(_) => self.status = "IP da interface inválido.".into(),
+                    }
+                }
+            } else if ui.button("■ Parar").clicked() {
+                self.capture = None; // Drop encerra a thread
+                self.status = "Captura parada.".into();
+            }
+            if let Some(c) = &self.capture {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, c.status());
+            }
+        });
+        ui.weak(
+            "Precisa rodar como Administrador. Loopback (127.0.0.1) e IPv6 não aparecem — \
+             use o IP de uma placa real.",
+        );
+
+        let Some(cap) = &self.capture else {
+            return;
+        };
+
+        let total_pkts = cap.shared.total_packets.load(std::sync::atomic::Ordering::Relaxed);
+        let total_bytes = cap.shared.total_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let mut convs = cap.shared.convs.lock().unwrap().clone();
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{} conversas · {total_pkts} pacotes · {}",
+                convs.len(),
+                human_bytes(total_bytes)
+            ));
+            ui.separator();
+            ui.label("Filtro:");
+            ui.text_edit_singleline(&mut self.capture_filter);
+        });
+
+        // ordena por volume (bytes) decrescente
+        convs.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        let filter = self.capture_filter.to_lowercase();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("capture_grid")
+                .num_columns(6)
+                .striped(true)
+                .spacing([14.0, 4.0])
+                .show(ui, |ui| {
+                    ui.strong("Proto");
+                    ui.strong("Porta local");
+                    ui.strong("Endpoint remoto");
+                    ui.strong("Pacotes");
+                    ui.strong("Volume");
+                    ui.strong("Último (s)");
+                    ui.end_row();
+
+                    for c in &convs {
+                        let remote = format!("{}:{}", c.remote_ip, c.remote_port);
+                        if !filter.is_empty()
+                            && !remote.to_lowercase().contains(&filter)
+                            && !c.local_port.to_string().contains(&filter)
+                            && !c.proto_name().to_lowercase().contains(&filter)
+                        {
+                            continue;
+                        }
+                        ui.label(c.proto_name());
+                        ui.monospace(c.local_port.to_string());
+                        ui.monospace(remote);
+                        ui.label(c.packets.to_string());
+                        ui.label(human_bytes(c.bytes));
+                        ui.label(format!("{:.1}", c.last_ms as f64 / 1000.0));
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn lcu_panel(&mut self, ui: &mut egui::Ui) {
+        if ui.link("‹ Jogos nativos suportados").clicked() {
+            self.tab = Tab::KernelOverview;
+        }
+        ui.heading("League of Legends — API local (LCU)");
+        ui.label(
+            "Fala com a API REST local do League Client (https://127.0.0.1) usando a porta e \
+             o token do lockfile. Acesso legítimo, sem injeção nem leitura da memória do jogo.",
+        );
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("🔍 Detectar client").clicked() {
+                match lcu::discover() {
+                    Ok(conn) => {
+                        self.status = format!("LCU detectado (pid {}, porta {}).", conn.pid, conn.port);
+                        self.lcu_conn = Some(conn);
+                    }
+                    Err(e) => {
+                        self.lcu_conn = None;
+                        self.status = format!("LCU: {e}");
+                    }
+                }
+            }
+            match &self.lcu_conn {
+                Some(c) => ui.colored_label(
+                    egui::Color32::LIGHT_GREEN,
+                    format!("conectado · 127.0.0.1:{} (pid {})", c.port, c.pid),
+                ),
+                None => ui.colored_label(egui::Color32::GRAY, "não detectado"),
+            };
+        });
+
+        let Some(conn) = self.lcu_conn.clone() else {
+            ui.weak("Abra o League Client e clique em Detectar.");
+            return;
+        };
+
+        ui.separator();
+        ui.label("Atalhos:");
+        ui.horizontal_wrapped(|ui| {
+            let shortcuts = [
+                ("Summoner atual", "/lol-summoner/v1/current-summoner"),
+                ("Fase do jogo", "/lol-gameflow/v1/gameflow-phase"),
+                ("Carteira (RP/BE)", "/lol-store/v1/wallet"),
+                ("Amigos", "/lol-chat/v1/friends"),
+                ("Sessão de seleção", "/lol-champ-select/v1/session"),
+            ];
+            for (name, path) in shortcuts {
+                if ui.button(name).clicked() {
+                    self.lcu_method = "GET".into();
+                    self.lcu_path = path.into();
+                    self.lcu_body.clear();
+                }
+            }
+        });
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_source("lcu_method")
+                .selected_text(&self.lcu_method)
+                .width(90.0)
+                .show_ui(ui, |ui| {
+                    for m in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+                        ui.selectable_value(&mut self.lcu_method, m.to_string(), m);
+                    }
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.lcu_path)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("/caminho/da/api"),
+            );
+        });
+
+        if !matches!(self.lcu_method.as_str(), "GET" | "DELETE") {
+            ui.label("Body (JSON):");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.lcu_body)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .code_editor(),
+            );
+        }
+
+        ui.horizontal(|ui| {
+            let busy = self.lcu_busy;
+            if ui.add_enabled(!busy, egui::Button::new("▶ Enviar")).clicked() {
+                self.lcu_rx = Some(lcu::request(
+                    &conn,
+                    self.lcu_method.clone(),
+                    self.lcu_path.clone(),
+                    self.lcu_body.clone(),
+                ));
+                self.lcu_busy = true;
+                self.lcu_status = 0;
+                self.lcu_resp.clear();
+            }
+            if busy {
+                ui.spinner();
+            } else if self.lcu_status != 0 {
+                let color = if self.lcu_status < 400 {
+                    egui::Color32::LIGHT_GREEN
+                } else {
+                    egui::Color32::LIGHT_RED
+                };
+                ui.colored_label(color, format!("HTTP {}", self.lcu_status));
+            }
+        });
+
+        if !self.lcu_resp.is_empty() {
+            ui.separator();
+            let mut resp = self.lcu_resp.clone(); // só exibição (read-only)
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut resp)
+                        .desired_width(f32::INFINITY)
+                        .interactive(false)
+                        .code_editor(),
+                );
+            });
+        }
     }
 
     fn proxy_panel(&mut self, ui: &mut egui::Ui) {

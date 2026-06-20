@@ -30,6 +30,8 @@ features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
     "Win32_Security",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
 ]
 
 [profile.release]
