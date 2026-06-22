@@ -29,6 +29,9 @@ iced-x86 = "1"
 # Dialogos nativos de abrir/salvar arquivo
 rfd = "0.14"
 
+# Camada de scripting / automacao (motor em Rust puro)
+rhai = "1"
+
 [dependencies.windows]
 version = "0.58"
 features = [

@@ -6,8 +6,9 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
     TH32CS_SNAPPROCESS,
 };
+use windows::Win32::Foundation::BOOL;
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+    IsWow64Process, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
     PROCESS_VM_WRITE,
 };
 
@@ -78,6 +79,20 @@ impl OpenProcessHandle {
 
     pub fn raw(&self) -> HANDLE {
         self.handle
+    }
+}
+
+/// Tamanho do ponteiro do processo alvo, em bytes: 4 (32-bit/WOW64) ou 8 (x64).
+///
+/// Assume um Windows x64 (o Quarry e compilado x64): um processo sob WOW64 e,
+/// por definicao, 32-bit. Em caso de erro assume 8 (x64), o caso comum.
+pub fn pointer_size(handle: HANDLE) -> usize {
+    let mut wow64 = BOOL(0);
+    let ok = unsafe { IsWow64Process(handle, &mut wow64) };
+    if ok.is_ok() && wow64.as_bool() {
+        4
+    } else {
+        8
     }
 }
 

@@ -25,6 +25,8 @@ pub struct PtrScanParams {
     pub max_depth: usize,
     pub alignment: usize,
     pub max_results: usize,
+    /// Tamanho do ponteiro do alvo em bytes: 4 (32-bit) ou 8 (x64).
+    pub ptr_size: usize,
 }
 
 /// Uma cadeia de ponteiros encontrada, do modulo ate o alvo.
@@ -109,12 +111,14 @@ fn build_pointer_map(
     handle: HANDLE,
     regions: &[Region],
     alignment: usize,
+    ptr_size: usize,
     committed: &Committed,
     progress: &ScanProgress,
 ) -> Vec<(u64, u64)> {
     let mut map: Vec<(u64, u64)> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
     let step = alignment.max(1);
+    let psize = if ptr_size == 4 { 4 } else { 8 };
 
     for region in regions {
         if progress.cancel.load(Ordering::Relaxed) {
@@ -122,11 +126,16 @@ fn build_pointer_map(
         }
         buf.clear();
         buf.resize(region.size, 0);
-        if memory::read_into(handle, region.base, &mut buf) && region.size >= 8 {
-            let end = region.size - 8;
+        if memory::read_into(handle, region.base, &mut buf) && region.size >= psize {
+            let end = region.size - psize;
             let mut off = 0usize;
             while off <= end {
-                let v = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+                // le um ponteiro de 4 ou 8 bytes conforme a arquitetura do alvo
+                let v = if psize == 4 {
+                    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as u64
+                } else {
+                    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+                };
                 if v != 0 && committed.contains(v) {
                     map.push((v, region.base + off as u64));
                 }
@@ -196,7 +205,14 @@ pub fn pointer_scan(
     progress: &ScanProgress,
 ) -> Vec<PtrPath> {
     let committed = Committed::from(regions);
-    let map = build_pointer_map(handle, regions, params.alignment, &committed, progress);
+    let map = build_pointer_map(
+        handle,
+        regions,
+        params.alignment,
+        params.ptr_size,
+        &committed,
+        progress,
+    );
 
     let mut results = Vec::new();
     let mut offsets = Vec::new();
@@ -205,14 +221,15 @@ pub fn pointer_scan(
 }
 
 /// Resolve uma cadeia para o endereco atual, dada a base do modulo no processo.
-pub fn resolve(handle: HANDLE, module_base: u64, path: &PtrPath) -> Option<u64> {
+/// `ptr_size` e 4 (alvo 32-bit) ou 8 (x64); cada deref le esse tanto de bytes.
+pub fn resolve(handle: HANDLE, module_base: u64, path: &PtrPath, ptr_size: usize) -> Option<u64> {
     if path.offsets.is_empty() {
         return None;
     }
-    let mut val = memory::read_u64(handle, module_base + path.base_offset)?;
+    let mut val = memory::read_ptr(handle, module_base + path.base_offset, ptr_size)?;
     let last = path.offsets.len() - 1;
     for off in &path.offsets[..last] {
-        val = memory::read_u64(handle, val.wrapping_add(*off))?;
+        val = memory::read_ptr(handle, val.wrapping_add(*off), ptr_size)?;
     }
     Some(val.wrapping_add(path.offsets[last]))
 }

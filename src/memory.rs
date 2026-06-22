@@ -115,6 +115,18 @@ pub fn read_u64(handle: HANDLE, address: u64) -> Option<u64> {
     }
 }
 
+/// Le um ponteiro de `ptr_size` bytes (4 ou 8) em `address`, estendendo para u64.
+/// Usado para suportar alvos de 32 bits (ponteiros de 4 bytes) alem de x64.
+pub fn read_ptr(handle: HANDLE, address: u64, ptr_size: usize) -> Option<u64> {
+    match ptr_size {
+        4 => {
+            let mut buf = [0u8; 4];
+            read_into(handle, address, &mut buf).then(|| u32::from_le_bytes(buf) as u64)
+        }
+        _ => read_u64(handle, address),
+    }
+}
+
 /// Escreve bytes em `address`. true se escreveu tudo.
 pub fn write_bytes(handle: HANDLE, address: u64, data: &[u8]) -> bool {
     let mut written = 0usize;

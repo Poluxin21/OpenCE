@@ -17,6 +17,7 @@
 //!   dd <expr> / dq <expr>                    escreve 4/8 bytes (little-endian)
 //!   nop [n]                                  escreve n bytes 0x90 (1 se omitido)
 //!   jmp <alvo> / call <alvo>                 salto/chamada relativo (rel32)
+//!   je/jne/jg/jl/jge/jle/ja/jb/...  <alvo>   salto condicional near (rel32)
 //!   jmp64 <alvo>                             salto absoluto x64 (FF 25 + endereco)
 //!   <instrucao x86>                          mov/add/sub/cmp/lea/push/... (ver asm_x86)
 //!
@@ -63,9 +64,35 @@ enum Emit {
     JmpRel(String),
     CallRel(String),
     JmpAbs(String),
+    /// salto condicional near (0F 8x rel32); guarda o codigo de condicao e o alvo.
+    Jcc(u8, String),
     Dq(String),
     Dd(String),
     Insn(asm_x86::Insn),
+}
+
+/// Codigo de condicao (nibble do opcode 0F 8x) para um mnemonico de salto
+/// condicional, cobrindo os sinonimos comuns. None se nao for um Jcc.
+fn cc_code(mnem: &str) -> Option<u8> {
+    Some(match mnem {
+        "jo" => 0x0,
+        "jno" => 0x1,
+        "jb" | "jc" | "jnae" => 0x2,
+        "jae" | "jnb" | "jnc" => 0x3,
+        "je" | "jz" => 0x4,
+        "jne" | "jnz" => 0x5,
+        "jbe" | "jna" => 0x6,
+        "ja" | "jnbe" => 0x7,
+        "js" => 0x8,
+        "jns" => 0x9,
+        "jp" | "jpe" => 0xA,
+        "jnp" | "jpo" => 0xB,
+        "jl" | "jnge" => 0xC,
+        "jge" | "jnl" => 0xD,
+        "jle" | "jng" => 0xE,
+        "jg" | "jnle" => 0xF,
+        _ => return None,
+    })
 }
 
 impl Emit {
@@ -74,6 +101,7 @@ impl Emit {
             Emit::Db(b) => b.len(),
             Emit::Nop(n) => *n,
             Emit::JmpRel(_) | Emit::CallRel(_) => 5,
+            Emit::Jcc(_, _) => 6, // 0F 8x + rel32
             Emit::JmpAbs(_) => 14,
             Emit::Dq(_) => 8,
             Emit::Dd(_) => 4,
@@ -87,6 +115,19 @@ impl Emit {
             Emit::Nop(n) => vec![0x90; *n],
             Emit::JmpRel(t) => rel_branch(0xE9, parse_expr(symbols, t)?, addr)?,
             Emit::CallRel(t) => rel_branch(0xE8, parse_expr(symbols, t)?, addr)?,
+            Emit::Jcc(cc, t) => {
+                let target = parse_expr(symbols, t)?;
+                // rel32 medido a partir do fim da instrucao (6 bytes: 0F 8x + rel32)
+                let rel = target as i64 - (addr as i64 + 6);
+                if rel < i32::MIN as i64 || rel > i32::MAX as i64 {
+                    return Err(format!(
+                        "salto condicional fora do alcance rel32 ({rel:#X}); aproxime o cave"
+                    ));
+                }
+                let mut v = vec![0x0F, 0x80 | cc];
+                v.extend_from_slice(&(rel as i32).to_le_bytes());
+                v
+            }
             Emit::JmpAbs(t) => {
                 let target = parse_expr(symbols, t)?;
                 let mut v = vec![0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
@@ -394,6 +435,9 @@ pub fn run_section(
             "jmp" => Emit::JmpRel(rest.join("")),
             "call" => Emit::CallRel(rest.join("")),
             "jmp64" => Emit::JmpAbs(rest.join("")),
+            _ if cc_code(&head).is_some() => {
+                Emit::Jcc(cc_code(&head).unwrap(), rest.join(""))
+            }
             "dq" => Emit::Dq(rest.join("")),
             "dd" => Emit::Dd(rest.join("")),
             _ => match asm_x86::parse(line) {

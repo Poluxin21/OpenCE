@@ -4,6 +4,7 @@ mod anticheat;
 mod asm_x86;
 mod assembler;
 mod capture;
+mod ce_import;
 mod debugger;
 mod disasm;
 mod hotkeys;
@@ -14,7 +15,9 @@ mod pointer;
 mod process;
 mod proxy;
 mod scan;
+mod script;
 mod table;
+mod unity;
 mod value;
 
 use std::collections::HashMap;
@@ -143,6 +146,9 @@ enum Tab {
     MemViewer,
     Assembler,
     Injecao,
+    Script,
+    Unity,
+    Correlacao,
     // --- Kernel Exploring (safe, sem injecao) ---
     Proxy,
     Capture,
@@ -153,9 +159,14 @@ enum Tab {
 impl Tab {
     fn section(self) -> Section {
         match self {
-            Tab::Busca | Tab::Pointer | Tab::MemViewer | Tab::Assembler | Tab::Injecao => {
-                Section::General
-            }
+            Tab::Busca
+            | Tab::Pointer
+            | Tab::MemViewer
+            | Tab::Assembler
+            | Tab::Injecao
+            | Tab::Script
+            | Tab::Unity
+            | Tab::Correlacao => Section::General,
             Tab::Proxy | Tab::Capture | Tab::Lcu | Tab::KernelOverview => Section::Kernel,
         }
     }
@@ -189,6 +200,10 @@ struct App {
     processes: Vec<ProcessInfo>,
     proc_filter: String,
     show_process_picker: bool,
+    /// Janela de Ajuda (hotkeys + explicacao dos sistemas).
+    show_help: bool,
+    /// Tamanho do ponteiro do alvo: 8 (x64) ou 4 (32-bit/WOW64).
+    attached_ptr_size: usize,
 
     attached: Option<Arc<OpenProcessHandle>>,
     attached_name: String,
@@ -309,6 +324,24 @@ struct App {
     patch_bytes_text: String,
     nop_addr_text: String,
     nop_len_text: String,
+
+    // --- aba de script / automacao ---
+    script_src: String,
+    script_output: String,
+    /// Execucao em andamento: recebe o resultado da thread de fundo.
+    script_task: Option<Receiver<script::ScriptResult>>,
+
+    // --- aba Unity/Mono ---
+    unity_info: Option<unity::UnityInfo>,
+
+    // --- aba Correlação memória ↔ rede ---
+    /// true = procurar bytes lidos de um endereço; false = procurar um valor digitado.
+    corr_by_addr: bool,
+    corr_value: String,
+    corr_type: ValueType,
+    corr_addr: String,
+    corr_len: String,
+    corr_results: Vec<CorrHit>,
 }
 
 impl Default for App {
@@ -318,6 +351,8 @@ impl Default for App {
             processes: Vec::new(),
             proc_filter: String::new(),
             show_process_picker: false,
+            show_help: false,
+            attached_ptr_size: 8,
             attached: None,
             attached_name: String::new(),
             value_type: ValueType::I32,
@@ -401,6 +436,19 @@ impl Default for App {
             patch_bytes_text: String::new(),
             nop_addr_text: String::new(),
             nop_len_text: "1".into(),
+
+            script_src: script::SAMPLE.to_string(),
+            script_output: String::new(),
+            script_task: None,
+
+            unity_info: None,
+
+            corr_by_addr: false,
+            corr_value: String::new(),
+            corr_type: ValueType::I32,
+            corr_addr: String::new(),
+            corr_len: "8".into(),
+            corr_results: Vec::new(),
         }
     }
 }
@@ -408,6 +456,42 @@ impl Default for App {
 fn parse_addr(text: &str) -> Option<u64> {
     let t = text.trim().trim_start_matches("0x").trim_start_matches("0X");
     u64::from_str_radix(t, 16).ok()
+}
+
+/// Procura a primeira ocorrência de `needle` em `haystack` (busca ingênua;
+/// os payloads capturados são pequenos, até alguns KB).
+fn find_sub(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+}
+
+/// Monta um [`CorrHit`] a partir de um pacote e do mapa de processos.
+fn corr_hit(
+    key: &capture::ConvKey,
+    pmap: &std::collections::HashMap<capture::ConvKey, String>,
+    rec: &capture::PacketRecord,
+    offset: usize,
+    needle_len: usize,
+) -> CorrHit {
+    let end = (offset + needle_len).min(rec.data.len());
+    let preview = rec.data[offset..end]
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    CorrHit {
+        process: pmap.get(key).cloned().unwrap_or_default(),
+        proto: capture::proto_label(key.0),
+        remote: format!("{}:{}", key.2, key.3),
+        outbound: rec.outbound,
+        ts_ms: rec.ts_ms,
+        offset,
+        preview,
+    }
 }
 
 /// Formata um numero de bytes em B/KB/MB/GB.
@@ -570,6 +654,18 @@ struct CaptureSession {
     total_bytes: u64,
 }
 
+/// Um acerto da correlação memória ↔ rede: bytes vistos na memória que também
+/// aparecem em um pacote capturado.
+struct CorrHit {
+    process: String,
+    proto: &'static str,
+    remote: String,
+    outbound: bool,
+    ts_ms: u64,
+    offset: usize,
+    preview: String,
+}
+
 /// Um pacote fixado no painel de Evidências (arrastado ou fixado pelo usuário).
 #[derive(Clone)]
 struct PinnedPacket {
@@ -650,9 +746,11 @@ impl App {
         match OpenProcessHandle::open(pid) {
             Ok(h) => {
                 let handle = Arc::new(h);
+                self.attached_ptr_size = process::pointer_size(handle.raw());
                 self.spawn_freezer(handle.clone());
                 self.attached = Some(handle);
-                self.attached_name = format!("{name} (pid {pid})");
+                let arch = if self.attached_ptr_size == 4 { "x86" } else { "x64" };
+                self.attached_name = format!("{name} (pid {pid}, {arch})");
                 self.scanner.reset();
                 self.refresh_module_bases(pid);
                 self.classify(pid, &name);
@@ -745,6 +843,7 @@ impl App {
         let stop = Arc::new(AtomicBool::new(false));
         self.freezer_stop = Some(stop.clone());
         let targets = self.frozen_targets.clone();
+        let ptr_size = self.attached_ptr_size;
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 {
@@ -753,7 +852,7 @@ impl App {
                         let addr = match &item.addr {
                             FrozenAddr::Fixed(a) => Some(*a),
                             FrozenAddr::Pointer { base, path } => {
-                                pointer::resolve(handle.raw(), *base, path)
+                                pointer::resolve(handle.raw(), *base, path, ptr_size)
                             }
                         };
                         if let Some(a) = addr {
@@ -868,6 +967,113 @@ impl App {
             path.display(),
             self.saved.len()
         );
+    }
+
+    /// Importa uma tabela `.CT` do Cheat Engine, convertendo suas entradas em
+    /// entradas da cheat table do Quarry. Enderecos `modulo+offset` sao resolvidos
+    /// com as bases dos modulos do processo anexado.
+    fn import_ct_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Cheat Engine Table", &["CT", "ct"])
+            .pick_file()
+        else {
+            return;
+        };
+        let xml = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("Falha ao ler {}: {e}", path.display());
+                return;
+            }
+        };
+        let entries = match ce_import::parse(&xml) {
+            Ok(e) => e,
+            Err(e) => {
+                self.status = format!("Falha ao importar .CT: {e}");
+                return;
+            }
+        };
+
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        for ce in entries {
+            // Ponteiro: precisa do nome do modulo para resolver dinamicamente.
+            if ce.is_pointer() {
+                let Some(module) = ce.module.clone() else {
+                    skipped += 1;
+                    continue;
+                };
+                let Some(vt) = ce.value_type else {
+                    skipped += 1;
+                    continue;
+                };
+                let path = PtrPath {
+                    module,
+                    base_offset: ce.base,
+                    offsets: ce.offsets.clone(),
+                };
+                // resolve agora se der (so para mostrar um endereco inicial)
+                let address = self
+                    .module_bases
+                    .get(&path.module)
+                    .and_then(|&base| {
+                        self.attached
+                            .as_ref()
+                            .and_then(|h| pointer::resolve(h.raw(), base, &path, self.attached_ptr_size))
+                    })
+                    .unwrap_or(0);
+                self.saved.push(SavedEntry {
+                    address,
+                    value_type: vt,
+                    desc: ce.desc,
+                    frozen: false,
+                    edit_text: String::new(),
+                    pointer: Some(path),
+                    str_len: ce.str_len,
+                });
+                added += 1;
+                continue;
+            }
+
+            let Some(vt) = ce.value_type else {
+                skipped += 1;
+                continue;
+            };
+            // Endereco estatico: absoluto, ou modulo+offset resolvido agora.
+            let address = match &ce.module {
+                None => ce.base,
+                Some(m) => match self.module_bases.get(m) {
+                    Some(&base) => base + ce.base,
+                    None => {
+                        // modulo nao carregado (ou nada anexado): nao da pra
+                        // resolver com seguranca — pula em vez de chutar.
+                        skipped += 1;
+                        continue;
+                    }
+                },
+            };
+            self.saved.push(SavedEntry {
+                address,
+                value_type: vt,
+                desc: ce.desc,
+                frozen: false,
+                edit_text: String::new(),
+                pointer: None,
+                str_len: ce.str_len,
+            });
+            added += 1;
+        }
+
+        self.rebuild_frozen_targets();
+        let note = if skipped > 0 {
+            format!(
+                " ({skipped} puladas — AoB/script ou modulo nao carregado; \
+                 anexe o jogo antes de importar para resolver modulo+offset)"
+            )
+        } else {
+            String::new()
+        };
+        self.status = format!("Importadas {added} entradas do .CT{note}.");
     }
 
     /// Monta os parametros de comparacao a partir da UI. None se o valor digitado
@@ -1104,11 +1310,12 @@ impl App {
             return;
         };
         let bases = self.module_bases.clone();
+        let ptr_size = self.attached_ptr_size;
         let before = self.ptr_results.len();
         self.ptr_results.retain(|path| {
             bases
                 .get(&path.module)
-                .and_then(|b| pointer::resolve(h.raw(), *b, path))
+                .and_then(|b| pointer::resolve(h.raw(), *b, path, ptr_size))
                 == Some(target)
         });
         self.status = format!(
@@ -1131,7 +1338,7 @@ impl App {
             None => Some(e.address),
             Some(path) => {
                 let base = *self.module_bases.get(&path.module)?;
-                pointer::resolve(h.raw(), base, path)
+                pointer::resolve(h.raw(), base, path, self.attached_ptr_size)
             }
         }
     }
@@ -1163,6 +1370,7 @@ impl App {
             max_depth,
             alignment,
             max_results: 5000,
+            ptr_size: self.attached_ptr_size,
         };
         let prog = progress.clone();
         std::thread::spawn(move || {
@@ -1303,11 +1511,13 @@ impl eframe::App for App {
         self.poll_aob_task();
         self.poll_repeater();
         self.poll_lcu();
+        self.poll_script_task();
         // repinta rapido durante a busca; medio com proxy/captura/lcu ativos; devagar ocioso
         if self.scan_task.is_some()
             || self.ptr_task.is_some()
             || self.aob_task.is_some()
             || self.unknown_task.is_some()
+            || self.script_task.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(60));
         } else if self.proxy.is_some()
@@ -1321,6 +1531,9 @@ impl eframe::App for App {
 
         if self.show_process_picker {
             self.process_picker(ctx);
+        }
+        if self.show_help {
+            self.help_window(ctx);
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -1337,6 +1550,15 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 self.protection_badge(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("❓ Ajuda")
+                        .on_hover_text("Hotkeys e explicação de cada sistema do Quarry")
+                        .clicked()
+                    {
+                        self.show_help = true;
+                    }
+                });
             });
 
             ui.horizontal(|ui| {
@@ -1374,6 +1596,9 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.tab, Tab::MemViewer, "Memory Viewer");
                     ui.selectable_value(&mut self.tab, Tab::Assembler, "Auto Assembler");
                     ui.selectable_value(&mut self.tab, Tab::Injecao, "Injeção");
+                    ui.selectable_value(&mut self.tab, Tab::Script, "Script");
+                    ui.selectable_value(&mut self.tab, Tab::Unity, "Unity/Mono");
+                    ui.selectable_value(&mut self.tab, Tab::Correlacao, "Correlação");
                 }
                 Section::Kernel => {
                     ui.selectable_value(&mut self.tab, Tab::Proxy, "Proxy HTTPS");
@@ -1411,6 +1636,9 @@ impl eframe::App for App {
             Tab::MemViewer => self.mem_viewer_panel(ui),
             Tab::Assembler => self.assembler_panel(ui),
             Tab::Injecao => self.inject_panel(ui),
+            Tab::Script => self.script_panel(ui),
+            Tab::Unity => self.unity_panel(ui),
+            Tab::Correlacao => self.corr_panel(ui),
             Tab::Proxy => self.proxy_panel(ui),
             Tab::Capture => self.capture_panel(ui),
             Tab::Lcu => self.lcu_panel(ui),
@@ -1420,6 +1648,186 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Janela de Ajuda: hotkeys globais + explicacao de cada sistema do Quarry.
+    fn help_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_help;
+        egui::Window::new("❓ Ajuda — Quarry")
+            .open(&mut open)
+            .resizable(true)
+            .default_size([560.0, 620.0])
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    // helper: um sistema = titulo em destaque + descricao.
+                    let system = |ui: &mut egui::Ui, nome: &str, texto: &str| {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(nome).strong());
+                        ui.label(texto);
+                    };
+
+                    ui.heading("⌨ Hotkeys globais");
+                    ui.label(
+                        "Funcionam mesmo com o jogo em foco (modificadores Ctrl+Alt evitam \
+                         conflito com teclas do jogo):",
+                    );
+                    egui::Grid::new("help_hotkeys")
+                        .num_columns(2)
+                        .striped(true)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            for (k, v) in [
+                                ("Ctrl+Alt+F1", "Congelar TODAS as entradas da Cheat Table"),
+                                ("Ctrl+Alt+F2", "Descongelar tudo"),
+                                ("Ctrl+Alt+F3", "Auto Assembler → aplicar [ENABLE]"),
+                                ("Ctrl+Alt+F4", "Auto Assembler → desfazer [DISABLE]"),
+                            ] {
+                                ui.monospace(k);
+                                ui.label(v);
+                                ui.end_row();
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.heading("🧭 As duas seções");
+                    ui.label(
+                        "O Quarry separa as funções por quanto elas “tocam” o processo. A barra \
+                         de cima alterna entre elas; a detecção de anti-cheat kernel pode forçar \
+                         o uso da seção segura.",
+                    );
+                    system(
+                        ui,
+                        "🔧 General Exploring (acessa o processo)",
+                        "Lê/escreve a memória do jogo: busca, pointer scan, viewer, assembler e \
+                         injeção. NÃO use em jogos online com anti-cheat (BattlEye/EAC/VAC): é \
+                         detectável e dá ban.",
+                    );
+                    system(
+                        ui,
+                        "🛡 Kernel Exploring (não toca o processo)",
+                        "Métodos seguros mesmo sob anti-cheat kernel: proxy HTTPS, captura \
+                         passiva de rede e API local do client. Não lê nem escreve no jogo.",
+                    );
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.heading("🔧 Sistemas — General Exploring");
+
+                    system(
+                        ui,
+                        "Busca",
+                        "First/Next scan em thread de fundo. Tipos i8–u64, float, double e strings \
+                         (UTF-8/UTF-16). Comparações: exato, maior/menor, entre (intervalo), \
+                         mudou/não mudou, aumentou/diminuiu. Não sabe o valor? Use o scan de \
+                         “valor inicial desconhecido”: tira um snapshot e vai filtrando por \
+                         mudou/aumentou/… até sobrar o endereço.",
+                    );
+                    system(
+                        ui,
+                        "Cheat Table (painel direito)",
+                        "Guarda endereços, mostra o valor ao vivo, escreve e CONGELA valores. \
+                         Salva/carrega em arquivo .qct e IMPORTA tabelas .CT do Cheat Engine \
+                         (anexe o jogo antes para resolver endereços módulo+offset).",
+                    );
+                    system(
+                        ui,
+                        "Pointer Scan",
+                        "O endereço de um valor muda a cada reabertura do jogo; o caminho de \
+                         ponteiros (ancorado num módulo) não. Acha cadeias estáveis \
+                         [\"game.exe\"+1A2B]+10+8 e as re-resolve a cada uso.",
+                    );
+                    system(
+                        ui,
+                        "Memory Viewer",
+                        "Hex dump + disassembly x86-64 ao vivo de qualquer endereço (navegue com \
+                         −80/+80). Cada instrução tem NOP e +tabela. O botão “o que escreve/acessa \
+                         este endereço” anexa um debugger e arma um breakpoint de hardware para \
+                         achar a instrução que altera o valor.",
+                    );
+                    system(
+                        ui,
+                        "Auto Assembler",
+                        "Scripts estilo Cheat Engine com [ENABLE]/[DISABLE]: aobscanmodule, alloc \
+                         de code cave perto do alvo, label, db/dd/dq, jmp/call/jmp64. Monta \
+                         mnemônicos x86-64 (mov/add/lea/shifts/SSE…) sem precisar de db cru. \
+                         Aplique/desfaça pelas hotkeys F3/F4.",
+                    );
+                    system(
+                        ui,
+                        "Injeção",
+                        "Lista módulos, faz AOB scan (curinga ??), aplica patch de bytes, NOP e \
+                         injeta DLL (LoadLibraryW + CreateRemoteThread).",
+                    );
+                    system(
+                        ui,
+                        "Script",
+                        "Automação via rhai (Rust puro), rodando em thread de fundo: \
+                         read_i32/read_f32/read_ptr/read_bytes, write_i32/write_bytes, \
+                         module_base(nome), aob_scan/aob_scan_module e print(). Bom para \
+                         orquestrar leituras/escritas e localizar padrões sem clicar.",
+                    );
+                    system(
+                        ui,
+                        "Unity/Mono",
+                        "Detecta o backend de um jogo Unity (Mono vs IL2CPP) pelos módulos e \
+                         lê a API mono_* direto da memória (só leitura). Mostra os pontos de \
+                         entrada para dissecar metadados; enumerar classes/campos virá depois.",
+                    );
+                    system(
+                        ui,
+                        "Correlação",
+                        "Liga o que você vê na memória ao que passa na rede: procura um valor \
+                         (ou os bytes de um endereço) no tráfego capturado, por processo. \
+                         Passivo e seguro — inicie antes a Captura passiva (Kernel).",
+                    );
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.heading("🛡 Sistemas — Kernel Exploring");
+
+                    system(
+                        ui,
+                        "Proxy HTTPS",
+                        "Proxy de interceptação estilo Burp com CA própria (MITM): Histórico, \
+                         Intercept (pausar/editar/forward), Repeater e Match & Replace. Só vê \
+                         HTTP(S) — login, loja, matchmaking. Instale a CA quarry-ca.pem e aponte \
+                         o jogo para 127.0.0.1:<porta>.",
+                    );
+                    system(
+                        ui,
+                        "Captura passiva",
+                        "Socket RAW promíscuo (SIO_RCVALL) + tabelas TCP/UDP do Windows para \
+                         atribuir cada conversa ao processo dono. Estilo Wireshark, por processo. \
+                         HTTPS aparece como ciphertext — use o Proxy para o conteúdo. Pin de \
+                         pacotes vira Evidência no painel direito.",
+                    );
+                    system(
+                        ui,
+                        "LCU (League Client)",
+                        "Cliente da API local do League Client: dispara requisições autenticadas \
+                         (método/path/body) contra o client local, sem tocar no jogo.",
+                    );
+                    system(
+                        ui,
+                        "Visão geral",
+                        "Resumo da seção Kernel e do roteamento por anti-cheat: quando um AC \
+                         kernel é detectado, a injeção é bloqueada e o fluxo vai para cá.",
+                    );
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(
+                            "⚠ Uso responsável: apenas seus próprios programas, jogos que \
+                             autorizam análise, ou alvos autorizados.",
+                        )
+                        .italics()
+                        .weak(),
+                    );
+                });
+            });
+        self.show_help = open;
+    }
+
     fn process_picker(&mut self, ctx: &egui::Context) {
         let mut open = true;
         let mut chosen: Option<(u32, String)> = None;
@@ -1663,6 +2071,16 @@ impl App {
             if ui.button("📂 Carregar tabela").clicked() {
                 self.load_table_dialog();
             }
+            if ui
+                .button("📥 Importar .CT")
+                .on_hover_text(
+                    "Importa uma tabela do Cheat Engine (.CT). Anexe o jogo antes \
+                     para resolver enderecos modulo+offset.",
+                )
+                .clicked()
+            {
+                self.import_ct_dialog();
+            }
             ui.weak(format!("{} entradas", self.saved.len()));
         });
         ui.weak(hotkeys::LEGEND);
@@ -1878,6 +2296,7 @@ impl App {
         }
 
         let handle = self.attached.clone();
+        let ptr_size = self.attached_ptr_size;
         let mut add_path: Option<PtrPath> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for path in self.ptr_results.iter().take(500) {
@@ -1886,7 +2305,7 @@ impl App {
                     let resolved = handle.as_ref().and_then(|h| {
                         self.module_bases
                             .get(&path.module)
-                            .and_then(|b| pointer::resolve(h.raw(), *b, path))
+                            .and_then(|b| pointer::resolve(h.raw(), *b, path, ptr_size))
                     });
                     let tag = match resolved {
                         Some(a) => format!("→ {a:X}"),
@@ -2163,6 +2582,366 @@ impl App {
                 self.aa_log = vec![format!("ERRO: {e}")];
             }
         }
+    }
+
+    /// Procura os bytes (de um valor digitado ou lidos de um endereço) no tráfego
+    /// capturado — correlação memória ↔ rede, sem tocar no processo via hook.
+    fn correlate(&mut self) {
+        self.corr_results.clear();
+
+        // 1) bytes-alvo
+        let needle: Vec<u8> = if self.corr_by_addr {
+            let Some(addr) = parse_addr(&self.corr_addr) else {
+                self.status = "Endereço inválido (use hex).".into();
+                return;
+            };
+            let len = self.corr_len.trim().parse::<usize>().unwrap_or(0);
+            if len == 0 || len > 256 {
+                self.status = "Tamanho inválido (1..256).".into();
+                return;
+            }
+            let Some(h) = self.attached.as_ref() else {
+                self.status = "Anexe um processo para ler o endereço.".into();
+                return;
+            };
+            match memory::read_bytes(h.raw(), addr, len) {
+                Some(b) => b,
+                None => {
+                    self.status = "Falha ao ler a memória nesse endereço.".into();
+                    return;
+                }
+            }
+        } else {
+            match self.corr_type.parse_to_bytes(&self.corr_value) {
+                Some(b) if !b.is_empty() => b,
+                _ => {
+                    self.status = "Valor inválido para o tipo selecionado.".into();
+                    return;
+                }
+            }
+        };
+
+        const MAX: usize = 300;
+        let mut hits: Vec<CorrHit> = Vec::new();
+
+        // 2) captura ao vivo
+        if let Some(cap) = &self.capture {
+            let pmap: std::collections::HashMap<capture::ConvKey, String> = cap
+                .shared
+                .convs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| (c.key(), c.process.clone()))
+                .collect();
+            let packets = cap.shared.packets.lock().unwrap();
+            for (key, deque) in packets.iter() {
+                for rec in deque.iter() {
+                    if hits.len() >= MAX {
+                        break;
+                    }
+                    if let Some(off) = find_sub(&rec.data, &needle) {
+                        hits.push(corr_hit(key, &pmap, rec, off, needle.len()));
+                    }
+                }
+                if hits.len() >= MAX {
+                    break;
+                }
+            }
+        }
+
+        // 3) sessões salvas
+        for s in &self.capture_sessions {
+            if hits.len() >= MAX {
+                break;
+            }
+            let pmap: std::collections::HashMap<capture::ConvKey, String> = s
+                .convs
+                .iter()
+                .map(|c| (c.key(), c.process.clone()))
+                .collect();
+            for (key, recs) in &s.packets {
+                for rec in recs {
+                    if hits.len() >= MAX {
+                        break;
+                    }
+                    if let Some(off) = find_sub(&rec.data, &needle) {
+                        hits.push(corr_hit(key, &pmap, rec, off, needle.len()));
+                    }
+                }
+            }
+        }
+
+        let n = hits.len();
+        self.corr_results = hits;
+        self.status = format!(
+            "Correlação: {n} pacote(s) contêm esses {} byte(s){}.",
+            needle.len(),
+            if n >= MAX { " (limite atingido)" } else { "" }
+        );
+    }
+
+    fn corr_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Correlação memória ↔ rede");
+        ui.label(
+            "Procura um valor da memória no tráfego capturado (e vice-versa), ligando \
+             o que você vê no jogo ao que passa na rede. Só leitura — inicie a Captura \
+             passiva (Kernel) ou abra sessões salvas antes.",
+        );
+        ui.weak(
+            "Obs.: o hook inline de send/recv (interceptar a função no processo) é a peça \
+             pesada/detectável que ainda falta; aqui a correlação é passiva e segura.",
+        );
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.corr_by_addr, false, "Por valor");
+            ui.selectable_value(&mut self.corr_by_addr, true, "Por endereço");
+        });
+
+        if self.corr_by_addr {
+            ui.horizontal(|ui| {
+                ui.label("Endereço (hex):");
+                ui.add(egui::TextEdit::singleline(&mut self.corr_addr).desired_width(160.0));
+                ui.label("bytes:");
+                ui.add(egui::TextEdit::singleline(&mut self.corr_len).desired_width(50.0));
+            });
+        } else {
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_source("corr_type")
+                    .selected_text(self.corr_type.label())
+                    .show_ui(ui, |ui| {
+                        for vt in ValueType::ALL {
+                            ui.selectable_value(&mut self.corr_type, vt, vt.label());
+                        }
+                    });
+                ui.add(egui::TextEdit::singleline(&mut self.corr_value).desired_width(200.0));
+            });
+        }
+
+        if ui.button("🔗 Correlacionar").clicked() {
+            self.correlate();
+        }
+        ui.separator();
+
+        if self.corr_results.is_empty() {
+            ui.weak("Nenhum acerto ainda.");
+            return;
+        }
+        ui.label(format!("{} acerto(s):", self.corr_results.len()));
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("corr_hits")
+                .num_columns(5)
+                .striped(true)
+                .spacing([12.0, 2.0])
+                .show(ui, |ui| {
+                    ui.strong("Dir");
+                    ui.strong("Processo");
+                    ui.strong("Remoto");
+                    ui.strong("t/off");
+                    ui.strong("Bytes");
+                    ui.end_row();
+                    for h in &self.corr_results {
+                        ui.label(if h.outbound { "▲ envio" } else { "▼ recv" });
+                        ui.label(if h.process.is_empty() { "?" } else { &h.process });
+                        ui.monospace(format!("{} {}", h.proto, h.remote));
+                        ui.monospace(format!("{:.3}s @{}", h.ts_ms as f64 / 1000.0, h.offset));
+                        ui.monospace(&h.preview);
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn unity_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Unity / Mono / IL2CPP");
+        ui.label(
+            "Detecta o backend de scripting do alvo e lê a API mono_* direto da \
+             memória (só leitura — não executa nada no jogo).",
+        );
+        ui.horizontal(|ui| {
+            if ui.button("🔍 Analisar processo").clicked() {
+                match self.attached.clone() {
+                    Some(h) => {
+                        let modules = inject::list_modules(h.pid);
+                        self.unity_info = Some(unity::analyze(h.raw(), &modules));
+                        self.status = "Análise Unity/Mono concluída.".into();
+                    }
+                    None => self.status = "Anexe um processo primeiro.".into(),
+                }
+            }
+            if self.unity_info.is_some() && ui.button("Limpar").clicked() {
+                self.unity_info = None;
+            }
+        });
+        ui.separator();
+
+        let Some(info) = &self.unity_info else {
+            ui.weak("Clique em “Analisar processo” para inspecionar o alvo anexado.");
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.label("Motor detectado:");
+            let color = match info.engine {
+                unity::Engine::Mono => egui::Color32::LIGHT_GREEN,
+                unity::Engine::Il2Cpp => egui::Color32::from_rgb(255, 180, 80),
+                unity::Engine::Unity => egui::Color32::LIGHT_BLUE,
+                unity::Engine::None => egui::Color32::GRAY,
+            };
+            ui.colored_label(color, egui::RichText::new(info.engine.label()).strong());
+        });
+
+        let module_row = |ui: &mut egui::Ui, rotulo: &str, m: &Option<inject::ModuleInfo>| {
+            if let Some(m) = m {
+                ui.monospace(format!(
+                    "{rotulo}: {} @ {:016X} ({} KB)",
+                    m.name,
+                    m.base,
+                    m.size / 1024
+                ));
+            }
+        };
+        module_row(ui, "Mono", &info.mono_module);
+        module_row(ui, "GameAssembly", &info.game_assembly);
+        module_row(ui, "UnityPlayer", &info.unity_player);
+
+        ui.add_space(6.0);
+        match info.engine {
+            unity::Engine::Mono => {
+                ui.label(format!(
+                    "API Mono: {} funções mono_* exportadas.",
+                    info.mono_export_count
+                ));
+                ui.weak(
+                    "Pontos de entrada para caminhar metadados (assemblies → classes → \
+                     campos). Enumerar exige chamar essas funções no alvo (fase futura, \
+                     detectável).",
+                );
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for name in &info.mono_exports {
+                        ui.monospace(name);
+                    }
+                    if info.mono_export_count > info.mono_exports.len() {
+                        ui.weak(format!(
+                            "… e mais {} (mostrando {}).",
+                            info.mono_export_count - info.mono_exports.len(),
+                            info.mono_exports.len()
+                        ));
+                    }
+                });
+            }
+            unity::Engine::Il2Cpp => {
+                ui.label(
+                    "IL2CPP: o C# foi compilado para nativo. Não há API mono_*; os \
+                     metadados ficam em global-metadata.dat / GameAssembly.dll e precisam \
+                     de um dump (ex.: Il2CppDumper) para mapear classes/campos.",
+                );
+            }
+            unity::Engine::Unity => {
+                ui.label(
+                    "UnityPlayer.dll presente, mas sem mono.dll nem GameAssembly.dll \
+                     carregados ainda — reanalise após o jogo terminar de iniciar.",
+                );
+            }
+            unity::Engine::None => {
+                ui.label("Não parece um jogo Unity (nenhum módulo Unity/Mono/IL2CPP).");
+            }
+        }
+    }
+
+    /// Dispara a execucao do script atual numa thread de fundo.
+    fn run_script(&mut self) {
+        if self.script_task.is_some() {
+            return;
+        }
+        let Some(h) = self.attached.clone() else {
+            self.status = "Anexe um processo primeiro.".into();
+            return;
+        };
+        let ptr_size = self.attached_ptr_size;
+        let bases = self.module_bases.clone();
+        let src = self.script_src.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.script_task = Some(rx);
+        self.script_output = "Executando…".into();
+        std::thread::spawn(move || {
+            let result = script::run(h, ptr_size, bases, &src);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Recolhe o resultado do script quando a thread termina.
+    fn poll_script_task(&mut self) {
+        let Some(rx) = &self.script_task else { return };
+        if let Ok(result) = rx.try_recv() {
+            self.script_task = None;
+            let mut text = result.output.join("\n");
+            if let Some(err) = result.error {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&format!("⛔ erro: {err}"));
+                self.status = "Script terminou com erro.".into();
+            } else {
+                self.status = "Script executado.".into();
+            }
+            if text.is_empty() {
+                text = "(sem saída)".into();
+            }
+            self.script_output = text;
+        }
+    }
+
+    fn script_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Script / Automação");
+        ui.label(
+            "Automatize leitura/escrita de memória e AOB scan com rhai. \
+             Funções: read_i32/read_f32/read_ptr/read_bytes, write_i32/write_bytes, \
+             module_base(nome), aob_scan(padrão), aob_scan_module(mod, padrão), print(x).",
+        );
+        ui.horizontal(|ui| {
+            let running = self.script_task.is_some();
+            if ui
+                .add_enabled(!running, egui::Button::new("▶ Executar"))
+                .clicked()
+            {
+                self.run_script();
+            }
+            if running {
+                ui.spinner();
+                ui.label("executando…");
+            }
+            if ui.button("Restaurar exemplo").clicked() {
+                self.script_src = script::SAMPLE.to_string();
+            }
+        });
+        ui.separator();
+
+        egui::ScrollArea::vertical()
+            .id_source("script_editor")
+            .max_height(ui.available_height() * 0.55)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.script_src)
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(16),
+                );
+            });
+
+        ui.separator();
+        ui.label("Saída:");
+        egui::ScrollArea::vertical()
+            .id_source("script_output")
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.script_output.as_str())
+                        .code_editor()
+                        .desired_width(f32::INFINITY),
+                );
+            });
     }
 
     fn assembler_panel(&mut self, ui: &mut egui::Ui) {

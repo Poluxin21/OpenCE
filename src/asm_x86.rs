@@ -6,9 +6,13 @@
 //!   add/sub/and/or/xor/cmp/adc/sbb   reg,imm | reg,reg | reg,[mem] | [mem],reg | [mem],imm
 //!   test  reg,reg | reg,imm | reg,[mem] | [mem],reg
 //!   lea   reg,[mem]
+//!   imul  reg,reg | reg,[mem]                 (forma de 2 operandos)
+//!   xchg  reg,reg | reg,[mem] | [mem],reg
+//!   shl/sal/shr/sar/rol/ror/rcl/rcr   r/m,imm8 | r/m,cl
+//!   movzx/movsx   reg, r/m8|r/m16             (byte/word [mem] ou reg8/16)
 //!   inc/dec/neg/not   reg | [mem]
 //!   push/pop  reg
-//!   ret
+//!   ret / nop / int3 / leave / cdq / cqo
 //!   SSE: movss/movsd/movups/movupd/movaps/movapd  xmm,xmm/[mem] | [mem],xmm
 //!        add/sub/mul/div ss|sd|ps|pd   xmm,xmm/[mem]
 //!        xorps/xorpd, cvtsi2ss/cvtsi2sd, cvttss2si/cvttsd2si
@@ -70,6 +74,8 @@ enum Repr {
     Push { num: u8 },
     Pop { num: u8 },
     Ret,
+    /// Bytes fixos sem operandos (leave/int3/cdq/cqo/nop/...).
+    Raw(Vec<u8>),
 }
 
 /// Uma instrucao montada: a forma + o texto do imediato (se houver).
@@ -129,6 +135,7 @@ impl Insn {
                 out.push(0x58 + (num & 7));
             }
             Repr::Ret => out.push(0xC3),
+            Repr::Raw(bytes) => out.extend_from_slice(bytes),
         }
         Ok(out)
     }
@@ -246,6 +253,12 @@ fn encode_mem(m: &Mem) -> Result<(Option<u8>, Vec<u8>, u8, u8, u8, u8), String> 
 fn append_imm(imm: i64, width: u8, out: &mut Vec<u8>) -> Result<(), String> {
     match width {
         0 => {}
+        1 => {
+            if imm < i8::MIN as i64 || imm > u8::MAX as i64 {
+                return Err(format!("imediato {imm:#X} nao cabe em 8 bits"));
+            }
+            out.push(imm as u8);
+        }
         4 => {
             if imm < i32::MIN as i64 || imm > u32::MAX as i64 {
                 return Err(format!("imediato {imm:#X} nao cabe em 32 bits"));
@@ -416,6 +429,11 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
     Ok(Operand::Imm(rest.to_string()))
 }
 
+/// Atalho para uma instrucao de bytes fixos sem operandos.
+fn raw(bytes: Vec<u8>) -> Insn {
+    Insn { repr: Repr::Raw(bytes), imm: None }
+}
+
 /// Tabela ALU: (opcode "r/m,r", digito do grupo 0x81/0x83).
 /// O opcode "r,r/m" e sempre o "r/m,r" + 2.
 fn alu(mnem: &str) -> Option<(u8, u8)> {
@@ -451,12 +469,24 @@ pub fn parse(line: &str) -> Option<Result<Insn, String>> {
 
     match mnem.as_str() {
         "ret" => Some(Ok(Insn { repr: Repr::Ret, imm: None })),
+        // instrucoes sem operandos comuns em code caves
+        "nop" => Some(Ok(raw(vec![0x90]))),
+        "int3" => Some(Ok(raw(vec![0xCC]))),
+        "leave" => Some(Ok(raw(vec![0xC9]))),
+        "cdq" => Some(Ok(raw(vec![0x99]))),
+        "cqo" => Some(Ok(raw(vec![0x48, 0x99]))),
         "mov" => Some(parse_mov(ops_res)),
         "lea" => Some(parse_lea(ops_res)),
         "test" => Some(parse_test(ops_res)),
         "push" | "pop" => Some(parse_pushpop(&mnem, ops_res)),
         "inc" | "dec" | "neg" | "not" => Some(parse_unary(&mnem, ops_res)),
         "movd" | "movq" => Some(parse_movdq(&mnem, ops_res)),
+        "shl" | "sal" | "shr" | "sar" | "rol" | "ror" | "rcl" | "rcr" => {
+            Some(parse_shift(&mnem, ops_res))
+        }
+        "imul" => Some(parse_imul(ops_res)),
+        "xchg" => Some(parse_xchg(ops_res)),
+        "movzx" | "movsx" => Some(parse_movx(&mnem, ops_res)),
         m if sse_table(m).is_some() => Some(parse_sse(m, ops_res)),
         m if alu(m).is_some() => Some(parse_alu(m, ops_res)),
         _ => None,
@@ -754,6 +784,141 @@ fn check_same_size(a: GReg, b: GReg, mnem: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Reconhece um registrador de 8 bits (low byte). Retorna o numero (0..15).
+/// Nao distingue ah/ch/dh/bh (legados sem REX) — so as formas low byte.
+fn parse_reg8(tok: &str) -> Option<u8> {
+    const R8: [&str; 16] = [
+        "al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b",
+        "r13b", "r14b", "r15b",
+    ];
+    R8.iter().position(|r| *r == tok).map(|i| i as u8)
+}
+
+/// Reconhece um registrador de 16 bits. Retorna o numero (0..15).
+fn parse_reg16(tok: &str) -> Option<u8> {
+    const R16: [&str; 16] = [
+        "ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w",
+        "r13w", "r14w", "r15w",
+    ];
+    R16.iter().position(|r| *r == tok).map(|i| i as u8)
+}
+
+/// Deslocamentos/rotacoes: `shl r/m, imm8` (C1 /digit ib), `shl r/m, cl`
+/// (D3 /digit). Tamanho fixo independe do valor (imm8 sempre 1 byte).
+fn parse_shift(mnem: &str, ops: Result<Vec<Operand>, String>) -> Result<Insn, String> {
+    let digit = match mnem {
+        "rol" => 0,
+        "ror" => 1,
+        "rcl" => 2,
+        "rcr" => 3,
+        "shl" | "sal" => 4,
+        "shr" => 5,
+        "sar" => 7,
+        _ => unreachable!(),
+    };
+    let (a, b) = two_ops(ops, mnem)?;
+    let (rm, w) = match a {
+        Operand::Reg(r) => (Rm::Reg(r.num), r.size == 8),
+        Operand::Mem(m, sz) => (Rm::Mem(m), rm_size(sz, 4)?),
+        _ => return Err(format!("{mnem}: destino deve ser registrador ou memoria")),
+    };
+    // contagem em CL  -> opcode D3, sem imediato
+    if let Operand::Imm(t) = &b {
+        if t.eq_ignore_ascii_case("cl") {
+            return Ok(Insn {
+                repr: Repr::RmI { opcode: 0xD3, digit, w, rm, imm_width: 0 },
+                imm: None,
+            });
+        }
+    }
+    // contagem imediata -> opcode C1 com imm8
+    match b {
+        Operand::Imm(t) => Ok(Insn {
+            repr: Repr::RmI { opcode: 0xC1, digit, w, rm, imm_width: 1 },
+            imm: Some(t),
+        }),
+        _ => Err(format!("{mnem}: contagem deve ser um imediato ou cl")),
+    }
+}
+
+/// `imul reg, r/m` (forma de dois operandos): 0F AF /r. Sem prefixo legado, com
+/// REX.W quando o destino e de 64 bits.
+fn parse_imul(ops: Result<Vec<Operand>, String>) -> Result<Insn, String> {
+    let (a, b) = two_ops(ops, "imul")?;
+    let dst = match a {
+        Operand::Reg(r) => r,
+        _ => return Err("imul: destino deve ser registrador (use a forma de 2 operandos)".into()),
+    };
+    let rm = match b {
+        Operand::Reg(s) => Rm::Reg(s.num),
+        Operand::Mem(m, _) => Rm::Mem(m),
+        _ => return Err("imul: origem deve ser registrador ou memoria".into()),
+    };
+    Ok(Insn {
+        repr: Repr::Sse { prefix: None, opcode: 0xAF, w: dst.size == 8, reg: dst.num, rm },
+        imm: None,
+    })
+}
+
+/// `xchg reg,reg | reg,[mem] | [mem],reg` (opcode 87 /r).
+fn parse_xchg(ops: Result<Vec<Operand>, String>) -> Result<Insn, String> {
+    let (a, b) = two_ops(ops, "xchg")?;
+    match (a, b) {
+        (Operand::Reg(x), Operand::Reg(y)) => {
+            check_same_size(x, y, "xchg")?;
+            Ok(Insn {
+                repr: Repr::RmR { opcode: 0x87, w: x.size == 8, reg: y.num, rm: Rm::Reg(x.num) },
+                imm: None,
+            })
+        }
+        (Operand::Reg(r), Operand::Mem(m, _)) | (Operand::Mem(m, _), Operand::Reg(r)) => Ok(Insn {
+            repr: Repr::RmR { opcode: 0x87, w: r.size == 8, reg: r.num, rm: Rm::Mem(m) },
+            imm: None,
+        }),
+        _ => Err("xchg: combinacao de operandos invalida".into()),
+    }
+}
+
+/// `movzx`/`movsx reg, r/m8|r/m16`: 0F B6/B7 (zero-extend) ou 0F BE/BF
+/// (sign-extend). A origem em memoria exige a palavra `byte`/`word`; em
+/// registrador, a largura vem do proprio registrador (al/ax/...).
+fn parse_movx(mnem: &str, ops: Result<Vec<Operand>, String>) -> Result<Insn, String> {
+    let signed = mnem == "movsx";
+    let (a, b) = two_ops(ops, mnem)?;
+    let dst = match a {
+        Operand::Reg(r) => r,
+        _ => return Err(format!("{mnem}: destino deve ser registrador")),
+    };
+    // (largura da origem em bytes 1|2, r/m)
+    let (src_w, rm) = match b {
+        Operand::Mem(m, Some(1)) => (1u8, Rm::Mem(m)),
+        Operand::Mem(m, Some(2)) => (2u8, Rm::Mem(m)),
+        Operand::Mem(_, _) => {
+            return Err(format!("{mnem}: especifique o tamanho da origem (byte/word [mem])"))
+        }
+        Operand::Imm(t) => {
+            if let Some(num) = parse_reg8(&t.to_lowercase()) {
+                (1, Rm::Reg(num))
+            } else if let Some(num) = parse_reg16(&t.to_lowercase()) {
+                (2, Rm::Reg(num))
+            } else {
+                return Err(format!("{mnem}: origem invalida '{t}'"));
+            }
+        }
+        _ => return Err(format!("{mnem}: origem deve ser registrador ou memoria")),
+    };
+    let opcode = match (signed, src_w) {
+        (false, 1) => 0xB6,
+        (false, _) => 0xB7,
+        (true, 1) => 0xBE,
+        (true, _) => 0xBF,
+    };
+    Ok(Insn {
+        repr: Repr::Sse { prefix: None, opcode, w: dst.size == 8, reg: dst.num, rm },
+        imm: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,6 +1053,48 @@ mod tests {
         assert_eq!(asm("lea rax, [rbx+0x10]"), vec![0x48, 0x8D, 0x43, 0x10]);
         // test eax, eax -> 85 C0
         assert_eq!(asm("test eax, eax"), vec![0x85, 0xC0]);
+    }
+
+    #[test]
+    fn shifts() {
+        // shl eax, 1 -> C1 E0 01 (sempre forma imm8, mesmo para 1)
+        assert_eq!(asm("shl eax, 1"), vec![0xC1, 0xE0, 0x01]);
+        // sar eax, 2 -> C1 F8 02
+        assert_eq!(asm("sar eax, 2"), vec![0xC1, 0xF8, 0x02]);
+        // shr rax, cl -> 48 D3 E8
+        assert_eq!(asm("shr rax, cl"), vec![0x48, 0xD3, 0xE8]);
+        // rol ebx, 4 -> C1 C3 04
+        assert_eq!(asm("rol ebx, 4"), vec![0xC1, 0xC3, 0x04]);
+    }
+
+    #[test]
+    fn imul_xchg() {
+        // imul ecx, edx -> 0F AF CA
+        assert_eq!(asm("imul ecx, edx"), vec![0x0F, 0xAF, 0xCA]);
+        // imul rax, rcx -> 48 0F AF C1
+        assert_eq!(asm("imul rax, rcx"), vec![0x48, 0x0F, 0xAF, 0xC1]);
+        // imul eax, [rbx] -> 0F AF 03
+        assert_eq!(asm("imul eax, [rbx]"), vec![0x0F, 0xAF, 0x03]);
+        // xchg eax, ecx -> 87 C8
+        assert_eq!(asm("xchg eax, ecx"), vec![0x87, 0xC8]);
+    }
+
+    #[test]
+    fn movzx_movsx() {
+        // movzx eax, al -> 0F B6 C0
+        assert_eq!(asm("movzx eax, al"), vec![0x0F, 0xB6, 0xC0]);
+        // movzx eax, byte [rcx] -> 0F B6 01
+        assert_eq!(asm("movzx eax, byte [rcx]"), vec![0x0F, 0xB6, 0x01]);
+        // movsx rax, word [rbx] -> 48 0F BF 03
+        assert_eq!(asm("movsx rax, word [rbx]"), vec![0x48, 0x0F, 0xBF, 0x03]);
+    }
+
+    #[test]
+    fn zero_operand() {
+        assert_eq!(asm("nop"), vec![0x90]);
+        assert_eq!(asm("int3"), vec![0xCC]);
+        assert_eq!(asm("leave"), vec![0xC9]);
+        assert_eq!(asm("cqo"), vec![0x48, 0x99]);
     }
 
     #[test]

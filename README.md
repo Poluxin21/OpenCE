@@ -18,12 +18,15 @@ toca no processo e funciona mesmo com anti-cheat kernel).
 
 | Aba | O que faz |
 |-----|-----------|
-| **Busca** | First/Next scan em thread de fundo (com barra de progresso e cancelar). Tipos `i8`–`u64`, `f32`, `f64` e **strings** (UTF-8/ASCII e UTF-16/Unicode). Comparações: valor exato, maior/menor, **entre (intervalo)**, mudou, não mudou, aumentou, diminuiu. Inteiros de 64 bits comparados com precisão total (sem perda de `f64`). |
-| **Cheat Table** | Salva endereços, mostra o valor em tempo real, escreve e **congela** valores. **Salva/carrega em arquivo `.qct`** (endereços, ponteiros, freeze e script do Auto Assembler). |
+| **Busca** | First/Next scan em thread de fundo (com barra de progresso e cancelar). Tipos `i8`–`u64`, `f32`, `f64` e **strings** (UTF-8/ASCII e UTF-16/Unicode). Comparações: valor exato, maior/menor, **entre (intervalo)**, mudou, não mudou, aumentou, diminuiu. **Scan de valor inicial desconhecido** (snapshot + filtragem por mudou/aumentou/…). Inteiros de 64 bits comparados com precisão total (sem perda de `f64`). |
+| **Cheat Table** | Salva endereços, mostra o valor em tempo real, escreve e **congela** valores. **Salva/carrega em arquivo `.qct`** (endereços, ponteiros, freeze e script do Auto Assembler) e **importa tabelas `.CT` do Cheat Engine**. |
 | **Pointer Scan** | Encontra cadeias de ponteiros estáveis (`["game.exe"+1A2B]+10+8`) que sempre levam ao endereço, mesmo após reiniciar o jogo — e as resolve dinamicamente. |
 | **Memory Viewer** | Hex dump e **disassembly x86-64** ao vivo de qualquer endereço, com NOP/+tabela por instrução, e **"o que escreve/acessa este endereço"** (breakpoint de hardware via debugger) para achar a instrução que altera um valor. |
-| **Auto Assembler** | Scripts estilo Cheat Engine (`[ENABLE]`/`[DISABLE]`): `aobscanmodule`, `alloc` de code cave perto do alvo, `label`, `db`, `jmp`/`call`/`jmp64`, `dq`/`dd`, `dealloc`. Aplica e desfaz patches. |
+| **Auto Assembler** | Scripts estilo Cheat Engine (`[ENABLE]`/`[DISABLE]`): `aobscanmodule`, `alloc` de code cave perto do alvo, `label`, `db`, `jmp`/`call`/`jmp64`, **saltos condicionais** (`je`/`jne`/`jg`/…), `dq`/`dd`, `dealloc`. Monta mnemônicos x86-64 (mov/add/lea/`imul`/shifts/`movzx`/SSE) sem `db` cru. Aplica e desfaz patches. |
 | **Injeção** | Lista módulos, AOB scan (com curinga `??`), patch de bytes, NOP e injeção de DLL (`LoadLibraryW` + `CreateRemoteThread`). |
+| **Script** | Automação via **rhai** (Rust puro) em thread de fundo: `read_i32`/`read_f32`/`read_ptr`/`read_bytes`, `write_i32`/`write_bytes`, `module_base(nome)`, `aob_scan`/`aob_scan_module`, `print`. |
+| **Unity/Mono** | Detecta o backend de scripting (Mono vs IL2CPP vs Unity) pelos módulos e lê a **API `mono_*`** direto do PE em memória (só leitura). |
+| **Correlação** | Liga memória e rede: procura um **valor (ou bytes de um endereço)** no **tráfego capturado** por processo, sem hook nem injeção. |
 | **Proxy HTTPS** *(Kernel Exploring)* | Proxy de interceptação com CA própria: **Histórico**, **Intercept** (pausar/editar/forward), **Repeater** e **Match & Replace**. Não toca no processo. Veja [Proxy HTTPS](#proxy-https-kernel-exploring). |
 
 > O Quarry separa as funções em duas seções: **General Exploring** (acessa o
@@ -44,8 +47,10 @@ funcionam de forma confiável entre execuções.
 - Windows (x64)
 - [Rust](https://www.rust-lang.org/tools/install) 1.75 ou superior
 
-> O pointer scan e a injeção assumem ponteiros de **8 bytes (x64)**. Compile como
-> x64 para alvos x64. Suporte a processos 32-bit está no roadmap.
+> A **busca de memória e o pointer scan** detectam a arquitetura do alvo
+> (x64 ou 32-bit/WOW64) e usam ponteiros de 8 ou 4 bytes automaticamente. A
+> **injeção de DLL e o Auto Assembler** ainda geram código **x64** — use-os
+> apenas em alvos x64.
 
 ## Compilar e rodar
 
@@ -86,10 +91,17 @@ src/
   table.rs     persistência da cheat table (.qct via serde)
   disasm.rs    disassembler x86-64 (Memory Viewer, sobre iced-x86)
   debugger.rs  "o que escreve aqui" (DebugActiveProcess + DR0–DR7)
+  asm_x86.rs   montador de mnemônicos x86-64 (back-end do Auto Assembler)
   assembler.rs auto assembler (scripts de code cave / patch)
   inject.rs    módulos, AOB scan, patch/NOP, injeção de DLL
   anticheat.rs detecção de anti-cheat e roteamento Kernel/General
   proxy.rs     proxy HTTPS de interceptação (MITM com CA própria)
+  capture.rs   captura passiva de rede por processo (RAW socket + IP Helper)
+  hotkeys.rs   hotkeys globais (RegisterHotKey)
+  lcu.rs       cliente da API local do League Client (LCU)
+  ce_import.rs import de tabelas .CT do Cheat Engine
+  script.rs    camada de scripting/automação (motor rhai)
+  unity.rs     dissector Unity/Mono/IL2CPP (detecção + exports da API mono)
 ```
 
 ## Auto Assembler
@@ -215,13 +227,15 @@ Auto Assembler. Assim o trabalho sobrevive a reinícios do jogo e do Quarry.
 - [x] Comparação por intervalo (entre X e Y) + precisão de inteiros 64-bit
 - [x] Hotkeys globais (congelar tudo / Auto Assembler enable-disable)
 - [x] Validação de pointer scan entre execuções
-- [ ] Scan de "valor inicial desconhecido"
-- [ ] Suporte a processos/ponteiros de 32-bit
-- [ ] Import de tabelas `.CT` do Cheat Engine
-- [ ] Camada de scripting (automação)
-- [ ] Hook de função (send/recv) + correlação memória ↔ rede
-- [ ] Dissector de Unity/Mono/.NET
-- [ ] Montador completo de mnemônicos (hoje o Auto Assembler usa `db` + diretivas)
+- [x] Scan de "valor inicial desconhecido"
+- [x] Suporte a processos/ponteiros de 32-bit (busca e pointer scan; injeção/AA seguem x64)
+- [x] Import de tabelas `.CT` do Cheat Engine
+- [x] Camada de scripting (automação) — motor rhai com API de memória/AOB
+- [x] Correlação memória ↔ rede (busca valores da memória no tráfego capturado)
+- [ ] Hook inline de send/recv (interceptar a função no processo — injeção, detectável)
+- [x] Dissector de Unity/Mono/.NET — detecção do backend + leitura da API `mono_*` (só leitura)
+- [ ] Dissector: enumerar assemblies/classes/campos (requer chamar `mono_*` no alvo)
+- [x] Montador de mnemônicos x86-64 (mov/add/lea/imul/shifts/movzx/SSE/jcc; `db` só para casos raros)
 
 ## Tecnologias
 
