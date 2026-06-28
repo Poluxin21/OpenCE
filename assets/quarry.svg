@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#101a28"/>
+      <stop offset="1" stop-color="#1c2a40"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffce7a"/>
+      <stop offset="1" stop-color="#e7913a"/>
+    </linearGradient>
+  </defs>
+
+  <!-- fundo: quadrado arredondado -->
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
+
+  <!-- aro de mira (predador/caca), sutil -->
+  <circle cx="128" cy="128" r="92" fill="none" stroke="url(#ring)" stroke-width="6" stroke-opacity="0.30"/>
+  <g stroke="url(#ring)" stroke-width="6" stroke-linecap="round" stroke-opacity="0.30">
+    <line x1="128" y1="20" x2="128" y2="40"/>
+    <line x1="128" y1="216" x2="128" y2="236"/>
+    <line x1="20" y1="128" x2="40" y2="128"/>
+    <line x1="216" y1="128" x2="236" y2="128"/>
+  </g>
+
+  <!-- gema facetada (a "pedra" extraida da memoria) -->
+  <!-- coroa -->
+  <polygon points="96,76 160,76 150,118 106,118" fill="#62b9ff"/>
+  <polygon points="96,76 106,118 72,118" fill="#3592e6"/>
+  <polygon points="160,76 184,118 150,118" fill="#2a7bd0"/>
+  <!-- pavilhao -->
+  <polygon points="72,118 128,118 128,200" fill="#1b62b4"/>
+  <polygon points="128,118 184,118 128,200" fill="#114a8c"/>
+  <!-- arestas/brilho -->
+  <g stroke="#bfe4ff" stroke-width="2" stroke-opacity="0.55" fill="none" stroke-linejoin="round">
+    <polygon points="96,76 160,76 184,118 128,200 72,118"/>
+    <line x1="106" y1="118" x2="96" y2="76"/>
+    <line x1="150" y1="118" x2="160" y2="76"/>
+    <line x1="72" y1="118" x2="184" y2="118"/>
+    <line x1="128" y1="118" x2="128" y2="200"/>
+  </g>
+  <!-- realce no topo -->
+  <polygon points="100,80 156,80 150,92 106,92" fill="#d7eeff" fill-opacity="0.85"/>
+
+  <!-- brilho -->
+  <path d="M182 66 l5 12 12 5 -12 5 -5 12 -5 -12 -12 -5 12 -5 z" fill="#ffe6b0"/>
+</svg>

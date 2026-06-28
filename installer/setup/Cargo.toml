@@ -1,0 +1,27 @@
+[package]
+name = "quarry-setup"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Instalador gráfico do Quarry (wizard) — embute o app + WinDivert."
+
+# Crate à parte (não entra no quarry.exe). Reusa egui/eframe para o wizard ter a
+# mesma cara do app. Embute os artefatos via include_bytes! em tempo de build,
+# então precisa que o quarry.exe (release) e o dist/WinDivert já existam — o
+# build-installer.ps1 cuida da ordem.
+
+[[bin]]
+name = "quarry-setup"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.28"
+egui = "0.28"
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 2
+
+[workspace]

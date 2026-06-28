@@ -10,10 +10,12 @@ mod disasm;
 mod hotkeys;
 mod inject;
 mod lcu;
+mod lcu_ws;
 mod memory;
 mod pointer;
 mod process;
 mod proxy;
+mod redirect;
 mod scan;
 mod script;
 mod table;
@@ -152,6 +154,7 @@ enum Tab {
     // --- Kernel Exploring (safe, sem injecao) ---
     Proxy,
     Capture,
+    Redirect,
     Lcu,
     KernelOverview,
 }
@@ -167,9 +170,26 @@ impl Tab {
             | Tab::Script
             | Tab::Unity
             | Tab::Correlacao => Section::General,
-            Tab::Proxy | Tab::Capture | Tab::Lcu | Tab::KernelOverview => Section::Kernel,
+            Tab::Proxy | Tab::Capture | Tab::Redirect | Tab::Lcu | Tab::KernelOverview => {
+                Section::Kernel
+            }
         }
     }
+}
+
+/// Sub-abas do painel da API local da Riot (LCU + jogos).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LcuView {
+    /// Console REST genérico (método/path/body).
+    Console,
+    /// Catálogo navegável de endpoints (via swagger/help).
+    Endpoints,
+    /// Feed de eventos ao vivo (WebSocket WAMP).
+    Eventos,
+    /// Dados de partida ao vivo (Live Client Data API, porta 2999).
+    Partida,
+    /// Recon de segurança / VDP: headers, CSRF/rebinding, auditoria de token.
+    Seguranca,
 }
 
 const AA_TEMPLATE: &str = "\
@@ -288,6 +308,8 @@ struct App {
     capture: Option<capture::CaptureHandle>,
     capture_iface: String,
     capture_filter: String,
+    /// Filtro por protocolo: None = todos, Some(6) = TCP, Some(17) = UDP.
+    capture_proto_filter: Option<u8>,
     /// Drill-down: processo selecionado (None = lista de processos).
     capture_pid: Option<u32>,
     /// Drill-down: conversa selecionada (None = lista de conversas do processo).
@@ -303,8 +325,16 @@ struct App {
     /// Evidência selecionada para detalhe.
     pinned_sel: Option<usize>,
 
+    // --- Redirect transparente por processo (WinDivert) ---
+    redirect: Option<redirect::RedirectHandle>,
+    redirect_pid_text: String,
+    redirect_port_text: String,
+
     // --- API local do client / LCU (Kernel Exploring) ---
+    lcu_view: LcuView,
     lcu_conn: Option<lcu::LcuConn>,
+    /// Conexão com o Riot Client (cross-game: VALORANT/LoR, conta, entitlements).
+    riot_conn: Option<lcu::LcuConn>,
     lcu_method: String,
     lcu_path: String,
     lcu_body: String,
@@ -312,6 +342,41 @@ struct App {
     lcu_busy: bool,
     lcu_status: u16,
     lcu_resp: String,
+    /// Headers da última resposta (console), formatados para exibição.
+    lcu_resp_headers: String,
+    // explorador de endpoints
+    lcu_endpoints: Vec<lcu::Endpoint>,
+    lcu_endpoint_filter: String,
+    lcu_help_rx: Option<lcu::LcuRx>,
+    lcu_help_busy: bool,
+    // feed de eventos (WebSocket)
+    lcu_ws: Option<lcu_ws::WsHandle>,
+    lcu_ws_filter: String,
+    // Live Client Data (porta 2999)
+    lc_path: String,
+    lc_rx: Option<lcu::LcuRx>,
+    lc_busy: bool,
+    lc_status: u16,
+    lc_resp: String,
+    // painel de segurança / VDP — lab de requisição livre (estilo Repeater)
+    vdp_method: String,
+    vdp_path: String,
+    /// Headers livres, um por linha ("Nome: valor"); pode forjar/sobrepor.
+    vdp_headers: String,
+    vdp_body: String,
+    /// Quando true, anexa a Basic Auth do lockfile; desligue para testar sem auth.
+    vdp_with_auth: bool,
+    vdp_rx: Option<lcu::LcuRx>,
+    vdp_busy: bool,
+    vdp_resp_status: u16,
+    vdp_resp_headers: String,
+    vdp_resp_body: String,
+    /// Análise automática de CORS sobre a última resposta.
+    vdp_cors_verdict: String,
+    // auditoria de exposição de token (C)
+    vdp_audit_rx: Option<Receiver<lcu::AuditReport>>,
+    vdp_audit_busy: bool,
+    vdp_report: Option<lcu::AuditReport>,
 
     // --- aba de injecao ---
     modules: Vec<inject::ModuleInfo>,
@@ -411,6 +476,7 @@ impl Default for App {
                 .map(|ip| ip.to_string())
                 .unwrap_or_default(),
             capture_filter: String::new(),
+            capture_proto_filter: None,
             capture_pid: None,
             capture_conv: None,
             capture_pkt: None,
@@ -418,7 +484,13 @@ impl Default for App {
             capture_session_sel: None,
             pinned: Vec::new(),
             pinned_sel: None,
+            redirect: None,
+            redirect_pid_text: String::new(),
+            redirect_port_text: "9999".into(),
+
+            lcu_view: LcuView::Console,
             lcu_conn: None,
+            riot_conn: None,
             lcu_method: "GET".into(),
             lcu_path: "/lol-summoner/v1/current-summoner".into(),
             lcu_body: String::new(),
@@ -426,6 +498,32 @@ impl Default for App {
             lcu_busy: false,
             lcu_status: 0,
             lcu_resp: String::new(),
+            lcu_resp_headers: String::new(),
+            lcu_endpoints: Vec::new(),
+            lcu_endpoint_filter: String::new(),
+            lcu_help_rx: None,
+            lcu_help_busy: false,
+            lcu_ws: None,
+            lcu_ws_filter: String::new(),
+            lc_path: "/liveclientdata/allgamedata".into(),
+            lc_rx: None,
+            lc_busy: false,
+            lc_status: 0,
+            lc_resp: String::new(),
+            vdp_method: "GET".into(),
+            vdp_path: "/lol-summoner/v1/current-summoner".into(),
+            vdp_headers: "Origin: https://evil.example\nHost: evil.example".into(),
+            vdp_body: String::new(),
+            vdp_with_auth: true,
+            vdp_rx: None,
+            vdp_busy: false,
+            vdp_resp_status: 0,
+            vdp_resp_headers: String::new(),
+            vdp_resp_body: String::new(),
+            vdp_cors_verdict: String::new(),
+            vdp_audit_rx: None,
+            vdp_audit_busy: false,
+            vdp_report: None,
             modules: Vec::new(),
             module_filter: String::new(),
             aob_text: String::new(),
@@ -456,6 +554,30 @@ impl Default for App {
 fn parse_addr(text: &str) -> Option<u64> {
     let t = text.trim().trim_start_matches("0x").trim_start_matches("0X");
     u64::from_str_radix(t, 16).ok()
+}
+
+/// Faz o parse de headers livres ("Nome: valor" por linha) para pares.
+/// Ignora linhas vazias e comentários (`#`).
+fn parse_header_lines(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            if l.is_empty() || l.starts_with('#') {
+                return None;
+            }
+            let (k, v) = l.split_once(':')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Formata uma lista de headers (nome, valor) para exibição multilinha.
+fn fmt_headers(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Procura a primeira ocorrência de `needle` em `haystack` (busca ingênua;
@@ -544,6 +666,144 @@ fn capture_l4_payload(rec: &capture::PacketRecord) -> &[u8] {
         }
         _ => &d[ihl..],
     }
+}
+
+/// Palpite do protocolo de aplicação a partir das portas + início do payload L4.
+/// Cobre os protocolos típicos de jogos (sobretudo os de UDP: QUIC, DTLS, STUN,
+/// RTP) além de DNS/HTTP/TLS. `None` quando nada bate.
+fn app_protocol(proto: u8, sport: u16, dport: u16, payload: &[u8]) -> Option<&'static str> {
+    let port = |p: u16| sport == p || dport == p;
+
+    // --- por porta (vale TCP e UDP) ---
+    if port(53) {
+        return Some("DNS");
+    }
+    if port(5353) {
+        return Some("mDNS");
+    }
+    if port(123) {
+        return Some("NTP");
+    }
+    if port(67) || port(68) {
+        return Some("DHCP");
+    }
+    if port(1900) {
+        return Some("SSDP");
+    }
+
+    if proto == 17 {
+        // STUN/TURN: magic cookie 0x2112A442 nos bytes 4..8 (usado por NAT
+        // traversal de voz/jogo).
+        if payload.len() >= 8 && payload[4..8] == [0x21, 0x12, 0xA4, 0x42] {
+            return Some("STUN/TURN");
+        }
+        // DTLS: content type 20..23 + major version 0xFE (DTLS 1.x).
+        if payload.len() >= 3 && (0x14..=0x17).contains(&payload[0]) && payload[1] == 0xFE {
+            return Some("DTLS");
+        }
+        // QUIC na 443: long header tem o bit alto (0x80) setado no 1º byte.
+        if port(443) {
+            return match payload.first() {
+                Some(b) if b & 0x80 != 0 => Some("QUIC"),
+                _ => Some("QUIC/UDP-443"),
+            };
+        }
+        // RTP/RTCP: versão 2 nos 2 bits altos do 1º byte (heurística fraca).
+        if payload.len() >= 12 && (payload[0] >> 6) == 2 {
+            return Some("RTP/RTCP?");
+        }
+    }
+
+    if proto == 6 {
+        if port(443) {
+            return Some("TLS/HTTPS");
+        }
+        if port(80) || port(8080) {
+            return Some("HTTP");
+        }
+    }
+    None
+}
+
+/// Palpite leve de serviço só pela porta (para a lista de conversas, que não
+/// guarda payload). `""` quando não reconhece.
+fn port_service(proto: u8, local: u16, remote: u16) -> &'static str {
+    let p = |x: u16| local == x || remote == x;
+    if p(53) || p(5353) {
+        "DNS"
+    } else if p(443) {
+        if proto == 17 {
+            "QUIC"
+        } else {
+            "HTTPS"
+        }
+    } else if p(80) || p(8080) {
+        "HTTP"
+    } else if p(123) {
+        "NTP"
+    } else if p(3478) || p(3479) {
+        "STUN/TURN"
+    } else {
+        ""
+    }
+}
+
+/// Disseca os campos do cabeçalho L4 (UDP ou TCP) de um pacote bruto, para o
+/// painel de detalhe. Retorna pares (campo, valor) já formatados.
+fn l4_fields(rec: &capture::PacketRecord) -> Vec<(&'static str, String)> {
+    let d = &rec.data;
+    if d.len() < 20 {
+        return Vec::new();
+    }
+    let ihl = ((d[0] & 0x0f) as usize) * 4;
+    let mut out = Vec::new();
+    match rec.proto {
+        17 => {
+            if d.len() < ihl + 8 {
+                return out;
+            }
+            let h = &d[ihl..ihl + 8];
+            let length = u16::from_be_bytes([h[4], h[5]]);
+            let cksum = u16::from_be_bytes([h[6], h[7]]);
+            out.push(("UDP src port", rec.src_port.to_string()));
+            out.push(("UDP dst port", rec.dst_port.to_string()));
+            out.push(("Length", format!("{length} B (header + dados)")));
+            out.push(("Checksum", format!("0x{cksum:04x}")));
+        }
+        6 => {
+            if d.len() < ihl + 20 {
+                return out;
+            }
+            let h = &d[ihl..ihl + 20];
+            let seq = u32::from_be_bytes([h[4], h[5], h[6], h[7]]);
+            let ack = u32::from_be_bytes([h[8], h[9], h[10], h[11]]);
+            let data_off = (h[12] >> 4) as usize * 4;
+            let flags = h[13];
+            let window = u16::from_be_bytes([h[14], h[15]]);
+            let mut fl = Vec::new();
+            for (bit, name) in [
+                (0x01, "FIN"),
+                (0x02, "SYN"),
+                (0x04, "RST"),
+                (0x08, "PSH"),
+                (0x10, "ACK"),
+                (0x20, "URG"),
+            ] {
+                if flags & bit != 0 {
+                    fl.push(name);
+                }
+            }
+            out.push(("TCP src port", rec.src_port.to_string()));
+            out.push(("TCP dst port", rec.dst_port.to_string()));
+            out.push(("Seq", seq.to_string()));
+            out.push(("Ack", ack.to_string()));
+            out.push(("Flags", if fl.is_empty() { "—".into() } else { fl.join(" ") }));
+            out.push(("Window", window.to_string()));
+            out.push(("Header len", format!("{data_off} B")));
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Se o payload parecer uma requisição/resposta HTTP em texto puro, devolve a
@@ -809,26 +1069,148 @@ impl App {
     }
 
     fn poll_lcu(&mut self) {
-        let Some(rx) = &mut self.lcu_rx else {
+        if let Some(rx) = &mut self.lcu_rx {
+            match lcu::poll(rx) {
+                lcu::LcuPoll::Pending => {}
+                lcu::LcuPoll::Done(Ok(r)) => {
+                    self.lcu_status = r.status;
+                    self.lcu_resp_headers = fmt_headers(&r.headers);
+                    self.lcu_resp = r.body;
+                    self.lcu_busy = false;
+                    self.lcu_rx = None;
+                }
+                lcu::LcuPoll::Done(Err(e)) => {
+                    self.lcu_status = 0;
+                    self.lcu_resp_headers.clear();
+                    self.lcu_resp = e;
+                    self.lcu_busy = false;
+                    self.lcu_rx = None;
+                }
+                lcu::LcuPoll::Closed => {
+                    self.lcu_busy = false;
+                    self.lcu_rx = None;
+                }
+            }
+        }
+        self.poll_lcu_help();
+        self.poll_live_client();
+        self.poll_vdp();
+    }
+
+    /// Recolhe o swagger/help do explorador de endpoints.
+    fn poll_lcu_help(&mut self) {
+        let Some(rx) = &mut self.lcu_help_rx else {
             return;
         };
         match lcu::poll(rx) {
-            lcu::LcuPoll::Pending => {}
+            lcu::LcuPoll::Pending => return,
             lcu::LcuPoll::Done(Ok(r)) => {
-                self.lcu_status = r.status;
-                self.lcu_resp = r.body;
-                self.lcu_busy = false;
-                self.lcu_rx = None;
+                if (200..300).contains(&r.status) {
+                    match lcu::parse_openapi(&r.body) {
+                        Ok(eps) => {
+                            self.status = format!("{} endpoints catalogados.", eps.len());
+                            self.lcu_endpoints = eps;
+                        }
+                        Err(e) => self.status = format!("Swagger: {e}"),
+                    }
+                } else {
+                    self.status =
+                        format!("Swagger indisponível (HTTP {}). Build do client sem openapi.", r.status);
+                }
+            }
+            lcu::LcuPoll::Done(Err(e)) => self.status = format!("Swagger: {e}"),
+            lcu::LcuPoll::Closed => {}
+        }
+        self.lcu_help_busy = false;
+        self.lcu_help_rx = None;
+    }
+
+    /// Recolhe a resposta da Live Client Data API (porta 2999).
+    fn poll_live_client(&mut self) {
+        let Some(rx) = &mut self.lc_rx else {
+            return;
+        };
+        match lcu::poll(rx) {
+            lcu::LcuPoll::Pending => return,
+            lcu::LcuPoll::Done(Ok(r)) => {
+                self.lc_status = r.status;
+                self.lc_resp = r.body;
             }
             lcu::LcuPoll::Done(Err(e)) => {
-                self.lcu_status = 0;
-                self.lcu_resp = e;
-                self.lcu_busy = false;
-                self.lcu_rx = None;
+                self.lc_status = 0;
+                self.lc_resp = format!(
+                    "{e}\n\n(A Live Client Data API só responde DURANTE uma partida ativa.)"
+                );
             }
-            lcu::LcuPoll::Closed => {
-                self.lcu_busy = false;
-                self.lcu_rx = None;
+            lcu::LcuPoll::Closed => {}
+        }
+        self.lc_busy = false;
+        self.lc_rx = None;
+    }
+
+    /// Recolhe o resultado do teste CSRF/rebinding e da auditoria de token.
+    fn poll_vdp(&mut self) {
+        if let Some(rx) = &mut self.vdp_rx {
+            match lcu::poll(rx) {
+                lcu::LcuPoll::Pending => {}
+                lcu::LcuPoll::Done(Ok(r)) => {
+                    self.vdp_resp_status = r.status;
+                    self.vdp_resp_headers = fmt_headers(&r.headers);
+                    // Análise automática de CORS sobre a origem enviada.
+                    let acao = r.header("access-control-allow-origin");
+                    let acac = r.header("access-control-allow-credentials");
+                    let accepted = (200..400).contains(&r.status);
+                    let permissive = acao
+                        .map(|v| v == "*" || v.contains("evil"))
+                        .unwrap_or(false);
+                    self.vdp_cors_verdict = if accepted && permissive {
+                        format!(
+                            "⚠ CORS permissivo: HTTP {} + Access-Control-Allow-Origin = {}{}. \
+                             Uma página web maliciosa poderia ler esta resposta (CSRF/rebinding).",
+                            r.status,
+                            acao.unwrap_or("?"),
+                            if acac == Some("true") { " + Allow-Credentials: true" } else { "" }
+                        )
+                    } else if accepted {
+                        format!(
+                            "HTTP {} sem CORS permissivo (ACAO = {}). Defesa de CORS presente — \
+                             cheque também validação de Host (rebinding) e cookies/SameSite.",
+                            r.status,
+                            acao.unwrap_or("<ausente>")
+                        )
+                    } else {
+                        format!("HTTP {} — requisição rejeitada.", r.status)
+                    };
+                    self.vdp_resp_body = r.body;
+                    self.vdp_busy = false;
+                    self.vdp_rx = None;
+                }
+                lcu::LcuPoll::Done(Err(e)) => {
+                    self.vdp_resp_status = 0;
+                    self.vdp_resp_headers.clear();
+                    self.vdp_resp_body = e;
+                    self.vdp_cors_verdict.clear();
+                    self.vdp_busy = false;
+                    self.vdp_rx = None;
+                }
+                lcu::LcuPoll::Closed => {
+                    self.vdp_busy = false;
+                    self.vdp_rx = None;
+                }
+            }
+        }
+        if let Some(rx) = &self.vdp_audit_rx {
+            match rx.try_recv() {
+                Ok(report) => {
+                    self.vdp_report = Some(report);
+                    self.vdp_audit_busy = false;
+                    self.vdp_audit_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.vdp_audit_busy = false;
+                    self.vdp_audit_rx = None;
+                }
             }
         }
     }
@@ -1522,7 +1904,13 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(60));
         } else if self.proxy.is_some()
             || self.capture.is_some()
+            || self.redirect.is_some()
             || self.lcu_busy
+            || self.lcu_ws.is_some()
+            || self.lc_busy
+            || self.lcu_help_busy
+            || self.vdp_busy
+            || self.vdp_audit_busy
         {
             ctx.request_repaint_after(Duration::from_millis(150));
         } else {
@@ -1603,6 +1991,8 @@ impl eframe::App for App {
                 Section::Kernel => {
                     ui.selectable_value(&mut self.tab, Tab::Proxy, "Proxy HTTPS");
                     ui.selectable_value(&mut self.tab, Tab::Capture, "Captura passiva");
+                    ui.selectable_value(&mut self.tab, Tab::Redirect, "Redirect (WinDivert)");
+                    ui.selectable_value(&mut self.tab, Tab::Lcu, "API Riot (LCU)");
                     ui.selectable_value(&mut self.tab, Tab::KernelOverview, "Visão geral");
                 }
             });
@@ -1641,6 +2031,7 @@ impl eframe::App for App {
             Tab::Correlacao => self.corr_panel(ui),
             Tab::Proxy => self.proxy_panel(ui),
             Tab::Capture => self.capture_panel(ui),
+            Tab::Redirect => self.redirect_panel(ui),
             Tab::Lcu => self.lcu_panel(ui),
             Tab::KernelOverview => self.kernel_panel(ui),
         });
@@ -1795,16 +2186,63 @@ impl App {
                     system(
                         ui,
                         "Captura passiva",
-                        "Socket RAW promíscuo (SIO_RCVALL) + tabelas TCP/UDP do Windows para \
-                         atribuir cada conversa ao processo dono. Estilo Wireshark, por processo. \
-                         HTTPS aparece como ciphertext — use o Proxy para o conteúdo. Pin de \
-                         pacotes vira Evidência no painel direito.",
+                        "Socket RAW promíscuo (SIO_RCVALL) que pega TCP e UDP + tabelas TCP/UDP \
+                         do Windows para atribuir cada conversa ao processo dono. Estilo \
+                         Wireshark, por processo. Filtro por protocolo (Todos/TCP/UDP); o detalhe \
+                         disseca o cabeçalho L4 e identifica o protocolo de aplicação \
+                         (DNS/QUIC/DTLS/STUN/RTP…). Tráfego de jogo é quase todo UDP. HTTPS/QUIC \
+                         aparece cifrado — use o Proxy para o conteúdo. Pin de pacotes vira \
+                         Evidência no painel direito.",
                     );
                     system(
                         ui,
-                        "LCU (League Client)",
+                        "Redirect (WinDivert)",
+                        "Proxifier embutido: força o TCP de saída de um processo pelo Quarry sem \
+                         injetar no jogo. Usa o driver WinDivert para redirecionar as conexões na \
+                         pilha de rede para um listener local, que faz a ponte até o destino real \
+                         e lê HTTP em texto puro. Requer WinDivert.dll + WinDivert64.sys e Admin; \
+                         um AC kernel (Vanguard) pode recusar o driver. Cert pinning ainda impede \
+                         decifrar HTTPS.",
+                    );
+                    system(
+                        ui,
+                        "API Riot (LCU) — Console",
                         "Cliente da API local do League Client: dispara requisições autenticadas \
-                         (método/path/body) contra o client local, sem tocar no jogo.",
+                         (método/path/body) contra o client, com atalhos e headers da resposta. \
+                         Também detecta o Riot Client (cross-game: VALORANT/LoR, conta, \
+                         entitlements). Sem tocar no jogo.",
+                    );
+                    system(
+                        ui,
+                        "API Riot — Endpoints",
+                        "Puxa o swagger/openapi do client e cataloga TODA a superfície local \
+                         (rotas + método + descrição), com busca. Clique numa rota para carregá-la \
+                         no Console. Recon de superfície num clique.",
+                    );
+                    system(
+                        ui,
+                        "API Riot — Eventos (WebSocket)",
+                        "Assina OnJsonApiEvent e mostra ao vivo cada mudança de estado do client \
+                         (fase de jogo, ready-check, champ select, lobby, loot…). Feed em tempo \
+                         real com filtro, em vez de polling manual.",
+                    );
+                    system(
+                        ui,
+                        "API Riot — Partida (Live Client 2999)",
+                        "Durante uma partida de LoL, lê https://127.0.0.1:2999/liveclientdata/* \
+                         (placar, itens, habilidades, ouro, eventos) — SEM auth, SEM lockfile, \
+                         SEM injeção. Só responde com partida ativa.",
+                    );
+                    system(
+                        ui,
+                        "API Riot — Segurança (VDP)",
+                        "Recon para bug bounty da Riot. Um Request Lab estilo Repeater: você monta \
+                         a requisição como quiser (método, path, headers — pode FORJAR/sobrepor \
+                         Origin/Host/etc., com ou sem a auth do lockfile — e body) e vê a resposta \
+                         inteira (status + todos os headers + body), com veredito automático de \
+                         CORS. Atalhos: forjar Origin/Host, preflight CORS, e auditoria de \
+                         exposição de token. Só para pesquisa AUTORIZADA, no escopo do programa; \
+                         reporte à Riot.",
                     );
                     system(
                         ui,
@@ -3083,9 +3521,16 @@ impl App {
         method(
             ui,
             "Captura passiva (raw socket)",
-            "Observa endpoints, portas, timing e volume na placa de rede. Conteúdo cifrado, \
-             mas ótimo para Threat Intel / mapeamento de infra.",
+            "Observa endpoints, portas, timing e volume na placa de rede (TCP+UDP), com ID de \
+             protocolo. Conteúdo cifrado, mas ótimo para Threat Intel / mapeamento de infra.",
             Tab::Capture,
+        );
+        method(
+            ui,
+            "Redirect transparente (WinDivert)",
+            "Força o TCP de um processo pelo Quarry — Proxifier embutido. Não injeta no jogo; \
+             requer WinDivert + Admin. Ponte até o destino real e leitura de HTTP em texto puro.",
+            Tab::Redirect,
         );
 
         ui.add_space(10.0);
@@ -3134,6 +3579,43 @@ impl App {
                     goto = Some(Tab::Lcu);
                 }
             });
+            ui.weak(
+                "Console REST · explorador de endpoints (swagger) · feed de eventos ao vivo \
+                 (WebSocket) · dados de partida (Live Client 2999) · recon de VDP \
+                 (CSRF/rebinding + auditoria de token).",
+            );
+
+            ui.add_space(6.0);
+            // Riot Client — cross-game (VALORANT / LoR / conta / entitlements).
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::from_rgb(0xff, 0x46, 0x55), "●");
+                ui.strong("Riot Client (cross-game)");
+                match &self.riot_conn {
+                    Some(c) => ui.colored_label(
+                        egui::Color32::LIGHT_GREEN,
+                        format!("detectado · 127.0.0.1:{}", c.port),
+                    ),
+                    None => ui.colored_label(egui::Color32::GRAY, "não detectado"),
+                };
+            });
+            ui.horizontal(|ui| {
+                if ui.button("🔍 Detectar Riot Client").clicked() {
+                    match lcu::discover_riot_client() {
+                        Ok(conn) => {
+                            self.status = format!("Riot Client detectado (porta {}).", conn.port);
+                            self.riot_conn = Some(conn);
+                            goto = Some(Tab::Lcu);
+                        }
+                        Err(e) => {
+                            self.riot_conn = None;
+                            self.status = format!("Riot Client: {e}");
+                        }
+                    }
+                }
+            });
+            ui.weak(
+                "Orquestrador da Riot: cobre conta, entitlements e o caminho para VALORANT/LoR.",
+            );
         });
 
         if let Some(tab) = goto {
@@ -3144,12 +3626,13 @@ impl App {
     fn capture_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Captura passiva");
         ui.label(
-            "Observa o tráfego IPv4 da placa de rede (raw socket promíscuo), atribui cada \
-             conversa ao processo dono do socket e guarda os pacotes para inspeção estilo \
-             Wireshark. Fluxo: escolha o processo → veja as conversas dele → abra um pacote \
-             para ver campos e o dump hex/ASCII. Não toca no processo: seguro sob anticheat \
-             kernel. Conteúdo HTTPS é cifrado (TLS) — para ver path/URL/body decodificados \
-             use o proxy MITM.",
+            "Observa o tráfego IPv4 da placa de rede (raw socket promíscuo) — TCP e UDP — \
+             atribui cada conversa ao processo dono do socket e guarda os pacotes para inspeção \
+             estilo Wireshark. Fluxo: filtre por protocolo (Todos/TCP/UDP) → escolha o processo \
+             → veja as conversas dele → abra um pacote para dissecar o cabeçalho L4 e ver o \
+             protocolo de aplicação (DNS/QUIC/DTLS/STUN/RTP…), texto e hex/ASCII. Tráfego de \
+             jogo é quase todo UDP. Não toca no processo: seguro sob anticheat kernel. Conteúdo \
+             HTTPS/QUIC é cifrado — para path/URL/body decodificados use o proxy MITM.",
         );
         ui.add_space(4.0);
 
@@ -3351,8 +3834,12 @@ impl App {
             bytes: u64,
             last_ms: u64,
         }
+        let proto_f = self.capture_proto_filter;
         let mut map: HashMap<u32, Agg> = HashMap::new();
         for c in convs {
+            if proto_f.is_some_and(|p| p != c.proto) {
+                continue;
+            }
             let e = map.entry(c.pid).or_insert_with(|| Agg {
                 name: String::new(),
                 convs: 0,
@@ -3382,6 +3869,7 @@ impl App {
             ui.label("Filtro:");
             ui.text_edit_singleline(&mut self.capture_filter);
         });
+        self.proto_filter_chips(ui);
 
         let filter = self.capture_filter.to_lowercase();
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -3432,11 +3920,40 @@ impl App {
         });
     }
 
+    /// Chips de filtro por protocolo (Todos / TCP / UDP), compartilhados entre
+    /// as views de processo e de conversa.
+    fn proto_filter_chips(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Protocolo:");
+            if ui
+                .selectable_label(self.capture_proto_filter.is_none(), "Todos")
+                .clicked()
+            {
+                self.capture_proto_filter = None;
+            }
+            if ui
+                .selectable_label(self.capture_proto_filter == Some(6), "TCP")
+                .clicked()
+            {
+                self.capture_proto_filter = Some(6);
+            }
+            if ui
+                .selectable_label(self.capture_proto_filter == Some(17), "UDP")
+                .clicked()
+            {
+                self.capture_proto_filter = Some(17);
+            }
+        });
+    }
+
     /// Nivel 2: conversas do processo selecionado.
     fn capture_conv_view(&mut self, ui: &mut egui::Ui, convs: &[capture::Conversation]) {
         let pid = self.capture_pid.unwrap();
-        let mut list: Vec<&capture::Conversation> =
-            convs.iter().filter(|c| c.pid == pid).collect();
+        let proto_f = self.capture_proto_filter;
+        let mut list: Vec<&capture::Conversation> = convs
+            .iter()
+            .filter(|c| c.pid == pid && proto_f.is_none_or(|p| p == c.proto))
+            .collect();
         list.sort_by(|a, b| b.bytes.cmp(&a.bytes));
 
         ui.horizontal(|ui| {
@@ -3445,15 +3962,17 @@ impl App {
             ui.label("Filtro:");
             ui.text_edit_singleline(&mut self.capture_filter);
         });
+        self.proto_filter_chips(ui);
 
         let filter = self.capture_filter.to_lowercase();
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("capture_conv_grid")
-                .num_columns(6)
+                .num_columns(7)
                 .striped(true)
                 .spacing([14.0, 4.0])
                 .show(ui, |ui| {
                     ui.strong("Proto");
+                    ui.strong("Serviço");
                     ui.strong("Porta local");
                     ui.strong("Endpoint remoto");
                     ui.strong("Pacotes");
@@ -3463,16 +3982,23 @@ impl App {
 
                     for c in &list {
                         let remote = format!("{}:{}", c.remote_ip, c.remote_port);
+                        let service = port_service(c.proto, c.local_port, c.remote_port);
                         if !filter.is_empty()
                             && !remote.to_lowercase().contains(&filter)
                             && !c.local_port.to_string().contains(&filter)
                             && !c.proto_name().to_lowercase().contains(&filter)
+                            && !service.to_lowercase().contains(&filter)
                         {
                             continue;
                         }
                         if ui.selectable_label(false, c.proto_name()).clicked() {
                             self.capture_conv = Some(c.key());
                             self.capture_pkt = None;
+                        }
+                        if service.is_empty() {
+                            ui.weak("—");
+                        } else {
+                            ui.label(service);
                         }
                         ui.monospace(c.local_port.to_string());
                         ui.monospace(remote);
@@ -3508,8 +4034,16 @@ impl App {
                 .show(&mut cols[0], |ui| {
                     for (i, p) in pkts.iter().enumerate().rev() {
                         let arrow = if p.outbound { "▲" } else { "▼" };
+                        let app = app_protocol(
+                            p.proto,
+                            p.src_port,
+                            p.dst_port,
+                            capture_l4_payload(p),
+                        )
+                        .map(|a| format!(" · {a}"))
+                        .unwrap_or_default();
                         let txt = format!(
-                            "{arrow} {:>7.3}s  {}  {} B",
+                            "{arrow} {:>7.3}s  {}  {} B{app}",
                             p.ts_ms as f64 / 1000.0,
                             p.proto_name(),
                             p.total_len
@@ -3571,6 +4105,16 @@ impl App {
                     ));
 
                     let payload = capture_l4_payload(p);
+
+                    // protocolo de aplicação identificado (DNS/QUIC/DTLS/STUN/RTP…)
+                    if let Some(app) = app_protocol(p.proto, p.src_port, p.dst_port, payload) {
+                        ui.add_space(4.0);
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0x8b, 0xe9, 0xfd),
+                            format!("Protocolo de aplicação: {app}"),
+                        );
+                    }
+
                     if let Some(line) = http_first_line(payload) {
                         ui.add_space(4.0);
                         ui.colored_label(egui::Color32::LIGHT_BLUE, format!("HTTP: {line}"));
@@ -3580,6 +4124,24 @@ impl App {
                             egui::Color32::GRAY,
                             "Porta 443 — provável TLS (cifrado). Use o proxy MITM para decodificar.",
                         );
+                    }
+
+                    // dissecção do cabeçalho L4 (UDP: portas/length/checksum; TCP: seq/ack/flags)
+                    let fields = l4_fields(p);
+                    if !fields.is_empty() {
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.label(format!("Cabeçalho {}:", p.proto_name()));
+                        egui::Grid::new("l4_fields_grid")
+                            .num_columns(2)
+                            .spacing([12.0, 2.0])
+                            .show(ui, |ui| {
+                                for (k, v) in &fields {
+                                    ui.weak(*k);
+                                    ui.monospace(v);
+                                    ui.end_row();
+                                }
+                            });
                     }
 
                     ui.add_space(6.0);
@@ -3692,22 +4254,138 @@ impl App {
         }
     }
 
+    fn redirect_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Redirect transparente (WinDivert)");
+        ui.label(
+            "Força o TCP de saída de um processo pelo Quarry — substituto embutido do Proxifier. \
+             Usa o driver do WinDivert para interceptar as conexões na pilha de rede (NÃO injeta \
+             no jogo), redireciona para um listener local e faz a ponte até o destino real, \
+             lendo HTTP em texto puro pelo caminho.",
+        );
+        ui.colored_label(
+            egui::Color32::from_rgb(0xff, 0xb0, 0x4d),
+            "Requer WinDivert.dll + WinDivert64.sys junto do quarry.exe e Administrador. Um \
+             anticheat kernel (Vanguard) pode recusar o driver — aí só funciona em jogos sem AC \
+             kernel. Cert pinning continua impedindo decifrar HTTPS (use junto do Proxy só onde \
+             não há pinning).",
+        );
+        ui.add_space(6.0);
+
+        let running = self.redirect.is_some();
+        ui.horizontal(|ui| {
+            ui.label("PID alvo:");
+            ui.add_enabled(
+                !running,
+                egui::TextEdit::singleline(&mut self.redirect_pid_text).desired_width(90.0),
+            );
+            if !running {
+                if let Some(h) = &self.attached {
+                    if ui
+                        .button("usar anexado")
+                        .on_hover_text("Preenche com o PID do processo anexado")
+                        .clicked()
+                    {
+                        self.redirect_pid_text = h.pid.to_string();
+                    }
+                }
+            }
+            ui.label("Porta do listener:");
+            ui.add_enabled(
+                !running,
+                egui::TextEdit::singleline(&mut self.redirect_port_text).desired_width(70.0),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            if !running {
+                if ui.button("▶ Iniciar redirect").clicked() {
+                    let pid = self.redirect_pid_text.trim().parse::<u32>();
+                    let port = self.redirect_port_text.trim().parse::<u16>();
+                    match (pid, port) {
+                        (Ok(pid), Ok(port)) if pid != 0 && port != 0 => {
+                            match redirect::start(pid, port) {
+                                Ok(h) => {
+                                    self.status =
+                                        format!("Redirect ativo: pid {pid} → 127.0.0.1:{port}.");
+                                    self.redirect = Some(h);
+                                }
+                                Err(e) => self.status = format!("Redirect: {e}"),
+                            }
+                        }
+                        _ => self.status = "PID/porta inválidos.".into(),
+                    }
+                }
+            } else if ui.button("■ Parar").clicked() {
+                self.redirect = None; // Drop encerra threads + fecha o WinDivert
+                self.status = "Redirect parado.".into();
+            }
+            if let Some(h) = &self.redirect {
+                ui.colored_label(egui::Color32::LIGHT_GREEN, h.status());
+                ui.separator();
+                ui.label(format!("{} pacotes redirecionados", h.redirected()));
+            }
+        });
+
+        // tabela de conexões redirecionadas
+        if let Some(h) = &self.redirect {
+            let conns = h.conns();
+            if conns.is_empty() {
+                ui.add_space(4.0);
+                ui.weak(
+                    "Sem conexões ainda. Faça o alvo abrir uma conexão TCP (login, matchmaking…).",
+                );
+                return;
+            }
+            ui.separator();
+            ui.label(format!("{} conexões", conns.len()));
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("redirect_conns")
+                    .num_columns(5)
+                    .striped(true)
+                    .spacing([14.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.strong("Porta cliente");
+                        ui.strong("Destino original");
+                        ui.strong("↑ envio");
+                        ui.strong("↓ recebido");
+                        ui.strong("HTTP");
+                        ui.end_row();
+                        for c in conns.iter().rev() {
+                            ui.monospace(c.client_port.to_string());
+                            ui.monospace(c.dst.to_string());
+                            ui.label(human_bytes(c.bytes_up));
+                            ui.label(human_bytes(c.bytes_down));
+                            if c.http.is_empty() {
+                                ui.weak("—");
+                            } else {
+                                ui.label(&c.http);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        }
+    }
+
     fn lcu_panel(&mut self, ui: &mut egui::Ui) {
         if ui.link("‹ Jogos nativos suportados").clicked() {
             self.tab = Tab::KernelOverview;
         }
-        ui.heading("League of Legends — API local (LCU)");
+        ui.heading("Riot — APIs locais (LCU · Live Client · Riot Client)");
         ui.label(
-            "Fala com a API REST local do League Client (https://127.0.0.1) usando a porta e \
-             o token do lockfile. Acesso legítimo, sem injeção nem leitura da memória do jogo.",
+            "Conversa com as APIs REST/WebSocket locais da Riot (https://127.0.0.1) usando a \
+             porta e o token do lockfile. Acesso legítimo, sem injeção nem leitura de memória — \
+             base de recon para o programa de VDP/bug bounty da Riot.",
         );
         ui.add_space(4.0);
 
+        // --- linha de conexão: LCU + Riot Client ---
         ui.horizontal(|ui| {
-            if ui.button("🔍 Detectar client").clicked() {
+            if ui.button("🔍 Detectar League Client").clicked() {
                 match lcu::discover() {
                     Ok(conn) => {
-                        self.status = format!("LCU detectado (pid {}, porta {}).", conn.pid, conn.port);
+                        self.status =
+                            format!("LCU detectado (pid {}, porta {}).", conn.pid, conn.port);
                         self.lcu_conn = Some(conn);
                     }
                     Err(e) => {
@@ -3719,18 +4397,61 @@ impl App {
             match &self.lcu_conn {
                 Some(c) => ui.colored_label(
                     egui::Color32::LIGHT_GREEN,
-                    format!("conectado · 127.0.0.1:{} (pid {})", c.port, c.pid),
+                    format!("LCU · 127.0.0.1:{} (pid {})", c.port, c.pid),
                 ),
-                None => ui.colored_label(egui::Color32::GRAY, "não detectado"),
+                None => ui.colored_label(egui::Color32::GRAY, "LCU não detectado"),
+            };
+        });
+        ui.horizontal(|ui| {
+            if ui.button("🔍 Detectar Riot Client").clicked() {
+                match lcu::discover_riot_client() {
+                    Ok(conn) => {
+                        self.status = format!("Riot Client detectado (porta {}).", conn.port);
+                        self.riot_conn = Some(conn);
+                    }
+                    Err(e) => {
+                        self.riot_conn = None;
+                        self.status = format!("Riot Client: {e}");
+                    }
+                }
+            }
+            match &self.riot_conn {
+                Some(c) => ui.colored_label(
+                    egui::Color32::LIGHT_GREEN,
+                    format!("Riot Client · 127.0.0.1:{} — cross-game (VALORANT/LoR)", c.port),
+                ),
+                None => ui.colored_label(egui::Color32::GRAY, "Riot Client não detectado"),
             };
         });
 
+        ui.add_space(4.0);
+        ui.separator();
+        // --- seletor de sub-aba ---
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.lcu_view, LcuView::Console, "🖥 Console");
+            ui.selectable_value(&mut self.lcu_view, LcuView::Endpoints, "📚 Endpoints");
+            ui.selectable_value(&mut self.lcu_view, LcuView::Eventos, "📡 Eventos (WS)");
+            ui.selectable_value(&mut self.lcu_view, LcuView::Partida, "🎯 Partida (2999)");
+            ui.selectable_value(&mut self.lcu_view, LcuView::Seguranca, "🛡 Segurança (VDP)");
+        });
+        ui.separator();
+
+        match self.lcu_view {
+            LcuView::Console => self.lcu_console_view(ui),
+            LcuView::Endpoints => self.lcu_endpoints_view(ui),
+            LcuView::Eventos => self.lcu_events_view(ui),
+            LcuView::Partida => self.lcu_match_view(ui),
+            LcuView::Seguranca => self.lcu_security_view(ui),
+        }
+    }
+
+    /// Console REST genérico contra o LCU.
+    fn lcu_console_view(&mut self, ui: &mut egui::Ui) {
         let Some(conn) = self.lcu_conn.clone() else {
-            ui.weak("Abra o League Client e clique em Detectar.");
+            ui.weak("Abra o League Client e clique em Detectar League Client.");
             return;
         };
 
-        ui.separator();
         ui.label("Atalhos:");
         ui.horizontal_wrapped(|ui| {
             let shortcuts = [
@@ -3788,6 +4509,7 @@ impl App {
                 self.lcu_busy = true;
                 self.lcu_status = 0;
                 self.lcu_resp.clear();
+                self.lcu_resp_headers.clear();
             }
             if busy {
                 ui.spinner();
@@ -3801,6 +4523,20 @@ impl App {
             }
         });
 
+        if !self.lcu_resp_headers.is_empty() {
+            egui::CollapsingHeader::new("Headers da resposta")
+                .id_source("lcu_resp_headers")
+                .show(ui, |ui| {
+                    let mut h = self.lcu_resp_headers.clone();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut h)
+                            .desired_width(f32::INFINITY)
+                            .interactive(false)
+                            .code_editor(),
+                    );
+                });
+        }
+
         if !self.lcu_resp.is_empty() {
             ui.separator();
             let mut resp = self.lcu_resp.clone(); // só exibição (read-only)
@@ -3813,6 +4549,420 @@ impl App {
                 );
             });
         }
+    }
+
+    /// Catálogo navegável de endpoints (recon): puxa o swagger/openapi do client.
+    fn lcu_endpoints_view(&mut self, ui: &mut egui::Ui) {
+        let Some(conn) = self.lcu_conn.clone() else {
+            ui.weak("Detecte o League Client primeiro.");
+            return;
+        };
+        ui.label(
+            "O LCU se autodocumenta. Puxe o catálogo e enumere TODA a superfície local de uma \
+             vez — inclusive rotas não documentadas e as que escrevem estado. Clique numa rota \
+             para carregá-la no Console.",
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.lcu_help_busy, egui::Button::new("⤓ Carregar catálogo"))
+                .clicked()
+            {
+                self.lcu_help_rx = Some(lcu::request(
+                    &conn,
+                    "GET".into(),
+                    "/swagger/v3/openapi.json".into(),
+                    String::new(),
+                ));
+                self.lcu_help_busy = true;
+            }
+            if self.lcu_help_busy {
+                ui.spinner();
+            }
+            if !self.lcu_endpoints.is_empty() {
+                ui.weak(format!("{} rotas", self.lcu_endpoints.len()));
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.lcu_endpoint_filter)
+                    .hint_text("filtrar (ex.: champ-select, wallet, POST)")
+                    .desired_width(260.0),
+            );
+        });
+
+        if self.lcu_endpoints.is_empty() {
+            return;
+        }
+        ui.separator();
+        let filter = self.lcu_endpoint_filter.to_ascii_lowercase();
+        let mut load: Option<(String, String)> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for ep in &self.lcu_endpoints {
+                if !filter.is_empty() {
+                    let hay =
+                        format!("{} {} {}", ep.method, ep.path, ep.summary).to_ascii_lowercase();
+                    if !hay.contains(&filter) {
+                        continue;
+                    }
+                }
+                ui.horizontal(|ui| {
+                    let color = match ep.method.as_str() {
+                        "GET" => egui::Color32::LIGHT_GREEN,
+                        "DELETE" => egui::Color32::LIGHT_RED,
+                        _ => egui::Color32::from_rgb(0xff, 0xb0, 0x4d), // escreve estado
+                    };
+                    ui.colored_label(color, egui::RichText::new(&ep.method).monospace());
+                    if ui.link(egui::RichText::new(&ep.path).monospace()).clicked() {
+                        load = Some((ep.method.clone(), ep.path.clone()));
+                    }
+                });
+                if !ep.summary.is_empty() {
+                    ui.weak(format!("    {}", ep.summary));
+                }
+            }
+        });
+        if let Some((method, path)) = load {
+            self.lcu_method = method;
+            self.lcu_path = path;
+            self.lcu_body.clear();
+            self.lcu_view = LcuView::Console;
+            self.status = "Rota carregada no Console.".into();
+        }
+    }
+
+    /// Feed de eventos ao vivo via WebSocket (WAMP).
+    fn lcu_events_view(&mut self, ui: &mut egui::Ui) {
+        let Some(conn) = self.lcu_conn.clone() else {
+            ui.weak("Detecte o League Client primeiro.");
+            return;
+        };
+        ui.label(
+            "Assina TODOS os eventos do client (OnJsonApiEvent) e mostra ao vivo cada mudança de \
+             estado: fase de jogo, ready-check, champ select, lobby, loot… Ótimo para mapear \
+             fluxos e flagrar dados sensíveis cruzando a fronteira local.",
+        );
+        ui.horizontal(|ui| {
+            match &self.lcu_ws {
+                None => {
+                    if ui.button("▶ Conectar feed").clicked() {
+                        self.lcu_ws = Some(lcu_ws::start(&conn));
+                    }
+                    ui.colored_label(egui::Color32::GRAY, "desconectado");
+                }
+                Some(ws) => {
+                    if ui.button("■ Desconectar").clicked() {
+                        self.lcu_ws = None; // Drop encerra a thread
+                    } else {
+                        ui.colored_label(egui::Color32::LIGHT_GREEN, ws.status());
+                    }
+                }
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.lcu_ws_filter)
+                    .hint_text("filtrar por uri/tipo")
+                    .desired_width(220.0),
+            );
+            if ui.button("🗑 Limpar").clicked() {
+                if let Some(ws) = &self.lcu_ws {
+                    ws.events.lock().unwrap().clear();
+                }
+            }
+        });
+
+        let Some(ws) = &self.lcu_ws else {
+            return;
+        };
+        ui.separator();
+        let filter = self.lcu_ws_filter.to_ascii_lowercase();
+        let events = ws.events.lock().unwrap();
+        ui.weak(format!("{} eventos no buffer (mais recentes embaixo)", events.len()));
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for ev in events.iter() {
+                    if !filter.is_empty() {
+                        let hay = format!("{} {}", ev.uri, ev.event_type).to_ascii_lowercase();
+                        if !hay.contains(&filter) {
+                            continue;
+                        }
+                    }
+                    let color = match ev.event_type.as_str() {
+                        "Create" => egui::Color32::LIGHT_GREEN,
+                        "Delete" => egui::Color32::LIGHT_RED,
+                        _ => egui::Color32::LIGHT_BLUE,
+                    };
+                    ui.horizontal(|ui| {
+                        ui.colored_label(color, egui::RichText::new(&ev.event_type).monospace());
+                        ui.label(egui::RichText::new(&ev.uri).monospace());
+                    });
+                    if !ev.data.is_empty() {
+                        ui.weak(format!("    {}", ev.data));
+                    }
+                }
+            });
+    }
+
+    /// Dados de partida ao vivo: Live Client Data API (porta 2999, sem auth).
+    fn lcu_match_view(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            "Durante uma partida de LoL, a Riot expõe https://127.0.0.1:2999/liveclientdata/* — \
+             SEM auth, SEM lockfile, SEM injeção (cert público da Riot). Dá placar, itens, \
+             habilidades, ouro e eventos em tempo real. Só responde com uma partida ATIVA.",
+        );
+        ui.horizontal_wrapped(|ui| {
+            let presets = [
+                ("Tudo da partida", "/liveclientdata/allgamedata"),
+                ("Jogador ativo", "/liveclientdata/activeplayer"),
+                ("Lista de jogadores", "/liveclientdata/playerlist"),
+                ("Eventos", "/liveclientdata/eventdata"),
+                ("Stats da partida", "/liveclientdata/gamestats"),
+            ];
+            for (name, path) in presets {
+                if ui.button(name).clicked() {
+                    self.lc_path = path.into();
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.lc_path)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("/liveclientdata/..."),
+            );
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.lc_busy, egui::Button::new("▶ Buscar"))
+                .clicked()
+            {
+                self.lc_rx = Some(lcu::http_request(
+                    2999,
+                    None,
+                    "GET".into(),
+                    self.lc_path.clone(),
+                    String::new(),
+                    Vec::new(),
+                ));
+                self.lc_busy = true;
+                self.lc_status = 0;
+                self.lc_resp.clear();
+            }
+            if self.lc_busy {
+                ui.spinner();
+            } else if self.lc_status != 0 {
+                let color = if self.lc_status < 400 {
+                    egui::Color32::LIGHT_GREEN
+                } else {
+                    egui::Color32::LIGHT_RED
+                };
+                ui.colored_label(color, format!("HTTP {}", self.lc_status));
+            }
+        });
+        if !self.lc_resp.is_empty() {
+            ui.separator();
+            let mut resp = self.lc_resp.clone();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut resp)
+                        .desired_width(f32::INFINITY)
+                        .interactive(false)
+                        .code_editor(),
+                );
+            });
+        }
+    }
+
+    /// Recon de segurança para VDP: CSRF/rebinding + auditoria de exposição de token.
+    fn lcu_security_view(&mut self, ui: &mut egui::Ui) {
+        let Some(conn) = self.lcu_conn.clone() else {
+            ui.weak("Detecte o League Client primeiro.");
+            return;
+        };
+        ui.colored_label(
+            egui::Color32::from_rgb(0xff, 0xb0, 0x4d),
+            "⚠ Use só para pesquisa AUTORIZADA, dentro do escopo do programa de VDP da Riot. \
+             Reporte à Riot; nada de explorar contas alheias.",
+        );
+        ui.add_space(4.0);
+
+        // ---- Lab de requisição livre (estilo Repeater, controle total) ----
+        ui.group(|ui| {
+            ui.strong("Request lab — monte a requisição como quiser");
+            ui.weak(
+                "Controle método, path, headers (pode FORJAR/sobrepor Origin, Host, etc.) e body. \
+                 A resposta vem inteira: status + todos os headers + corpo. É o seu Repeater \
+                 contra o LCU.",
+            );
+
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_source("vdp_method")
+                    .selected_text(&self.vdp_method)
+                    .width(90.0)
+                    .show_ui(ui, |ui| {
+                        for m in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
+                            ui.selectable_value(&mut self.vdp_method, m.to_string(), m);
+                        }
+                    });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.vdp_path)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("/caminho/da/api"),
+                );
+            });
+
+            ui.label("Headers (um por linha, \"Nome: valor\"):");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.vdp_headers)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .code_editor()
+                    .hint_text("Origin: https://evil.example\nHost: evil.example"),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.vdp_with_auth, "Auth do lockfile")
+                    .on_hover_text(
+                        "Anexa o Authorization do token. Desligue para testar se o endpoint \
+                         responde SEM autenticação (possível achado).",
+                    );
+                if ui.button("+ Origin/Host forjados").clicked() {
+                    if !self.vdp_headers.trim().is_empty() && !self.vdp_headers.ends_with('\n') {
+                        self.vdp_headers.push('\n');
+                    }
+                    self.vdp_headers
+                        .push_str("Origin: https://evil.example\nHost: evil.example");
+                }
+                if ui.button("+ CORS preflight").clicked() {
+                    self.vdp_method = "OPTIONS".into();
+                    if !self.vdp_headers.trim().is_empty() && !self.vdp_headers.ends_with('\n') {
+                        self.vdp_headers.push('\n');
+                    }
+                    self.vdp_headers.push_str(
+                        "Origin: https://evil.example\n\
+                         Access-Control-Request-Method: GET",
+                    );
+                }
+            });
+
+            if !matches!(self.vdp_method.as_str(), "GET" | "DELETE" | "HEAD" | "OPTIONS") {
+                ui.label("Body:");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.vdp_body)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .code_editor(),
+                );
+            }
+
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.vdp_busy, egui::Button::new("▶ Enviar"))
+                    .clicked()
+                {
+                    let auth = self.vdp_with_auth.then(|| conn.auth_header());
+                    self.vdp_rx = Some(lcu::http_request(
+                        conn.port,
+                        auth,
+                        self.vdp_method.clone(),
+                        self.vdp_path.clone(),
+                        self.vdp_body.clone(),
+                        parse_header_lines(&self.vdp_headers),
+                    ));
+                    self.vdp_busy = true;
+                    self.vdp_resp_status = 0;
+                    self.vdp_resp_headers.clear();
+                    self.vdp_resp_body.clear();
+                    self.vdp_cors_verdict.clear();
+                }
+                if self.vdp_busy {
+                    ui.spinner();
+                } else if self.vdp_resp_status != 0 {
+                    let color = if self.vdp_resp_status < 400 {
+                        egui::Color32::LIGHT_GREEN
+                    } else {
+                        egui::Color32::LIGHT_RED
+                    };
+                    ui.colored_label(color, format!("HTTP {}", self.vdp_resp_status));
+                }
+            });
+
+            // veredito automático de CORS (análise da resposta)
+            if !self.vdp_cors_verdict.is_empty() {
+                let color = if self.vdp_cors_verdict.starts_with('⚠') {
+                    egui::Color32::LIGHT_RED
+                } else {
+                    egui::Color32::from_rgb(0xff, 0xb0, 0x4d)
+                };
+                ui.colored_label(color, &self.vdp_cors_verdict);
+            }
+
+            // resposta completa: headers + body
+            if !self.vdp_resp_headers.is_empty() {
+                egui::CollapsingHeader::new("Headers da resposta")
+                    .id_source("vdp_resp_headers")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let mut h = self.vdp_resp_headers.clone();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut h)
+                                .desired_width(f32::INFINITY)
+                                .interactive(false)
+                                .code_editor(),
+                        );
+                    });
+            }
+            if !self.vdp_resp_body.is_empty() {
+                let mut b = self.vdp_resp_body.clone();
+                egui::ScrollArea::vertical()
+                    .id_source("vdp_resp_body")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut b)
+                                .desired_width(f32::INFINITY)
+                                .interactive(false)
+                                .code_editor(),
+                        );
+                    });
+            }
+        });
+
+        ui.add_space(6.0);
+        // ---- C: auditoria de exposição de token/segredo ----
+        ui.group(|ui| {
+            ui.strong("Exposição de token / segredos");
+            ui.weak(
+                "Demonstra que qualquer processo do usuário, lendo o lockfile (token em texto \
+                 puro), consegue puxar tokens de auth e PII. Sonda endpoints sensíveis e mostra \
+                 o que vaza — material direto para o report.",
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.vdp_audit_busy, egui::Button::new("▶ Auditar exposição"))
+                    .clicked()
+                {
+                    self.vdp_audit_rx = Some(lcu::audit(&conn));
+                    self.vdp_audit_busy = true;
+                    self.vdp_report = None;
+                }
+                if self.vdp_audit_busy {
+                    ui.spinner();
+                }
+            });
+            if let Some(report) = &self.vdp_report {
+                ui.colored_label(egui::Color32::from_rgb(0xff, 0xb0, 0x4d), &report.lockfile_note);
+                ui.add_space(2.0);
+                for f in &report.findings {
+                    ui.horizontal(|ui| {
+                        if f.leaked {
+                            ui.colored_label(egui::Color32::LIGHT_RED, "⚠ VAZA");
+                        } else {
+                            ui.colored_label(egui::Color32::GRAY, "—");
+                        }
+                        ui.label(egui::RichText::new(&f.label).strong());
+                        ui.weak(format!("HTTP {}", f.status));
+                    });
+                    ui.weak(format!("    {}  ·  {}", f.path, f.note));
+                }
+            }
+        });
     }
 
     fn proxy_panel(&mut self, ui: &mut egui::Ui) {

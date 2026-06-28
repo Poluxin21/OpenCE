@@ -1,5 +1,15 @@
 # Artefatos de build do Cargo
 /target/
+/tools/iconize/target/
+/installer/setup/target/
+
+# Empacotamento / instalador
+/dist/
+/installer/Output/
+
+# CA gerada pelo proxy em runtime
+/quarry-ca.pem
+/quarry-ca.key.pem
 
 # Backtraces
 *.rs.bk

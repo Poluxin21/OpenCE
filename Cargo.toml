@@ -32,6 +32,10 @@ rfd = "0.14"
 # Camada de scripting / automacao (motor em Rust puro)
 rhai = "1"
 
+# WebSocket cliente (stream de eventos do LCU — WAMP sobre wss)
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+
 [dependencies.windows]
 version = "0.58"
 features = [
@@ -50,6 +54,10 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[build-dependencies]
+# Embute o icone (.ico) e o manifesto (requer Admin em release) no quarry.exe.
+winresource = "0.1"
 
 [profile.release]
 opt-level = 3

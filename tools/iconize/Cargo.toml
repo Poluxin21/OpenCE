@@ -1,0 +1,16 @@
+[package]
+name = "iconize"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Ferramenta de build à parte: rasteriza assets/quarry.svg para .ico/.png.
+# Não faz parte do crate principal (não entra nas deps do quarry.exe).
+
+[dependencies]
+resvg = "0.44"
+usvg = "0.44"
+tiny-skia = "0.11"
+ico = "0.3"
+
+[workspace]

@@ -18,6 +18,7 @@ jobs:
       # assinatura e pulado (nao quebra o build).
       CODESIGN_PFX: ${{ secrets.CODESIGN_PFX_BASE64 }}
       CODESIGN_PWD: ${{ secrets.CODESIGN_PWD }}
+      WINDIVERT_VERSION: "2.2.2"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,40 +30,72 @@ jobs:
       - name: Cache de dependencias
         uses: Swatinem/rust-cache@v2
 
-      - name: Build (release)
+      # 1) o quarry.exe (com icone + manifesto de Admin embutidos via build.rs)
+      - name: Build quarry (release)
         run: cargo build --release --locked
+
+      # 2) WinDivert (driver da aba Redirect) — o instalador embute estes arquivos
+      - name: Preparar WinDivert
+        run: |
+          $ver = $env:WINDIVERT_VERSION
+          $url = "https://github.com/basil00/WinDivert/releases/download/v$ver/WinDivert-$ver-A.zip"
+          $zip = "$env:RUNNER_TEMP\windivert.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\windivert" -Force
+          $x64 = Get-ChildItem "$env:RUNNER_TEMP\windivert" -Recurse -Directory |
+            Where-Object { $_.Name -eq 'x64' } | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path dist\WinDivert | Out-Null
+          Copy-Item (Join-Path $x64.FullName 'WinDivert.dll')   dist\WinDivert -Force
+          Copy-Item (Join-Path $x64.FullName 'WinDivert64.sys') dist\WinDivert -Force
+
+      # 3) o instalador grafico (embute quarry.exe + WinDivert + icone)
+      - name: Build instalador
+        run: cargo build --release --manifest-path installer/setup/Cargo.toml
+
+      # 4) empacota como dist\quarry-setup-<versao>.exe
+      - name: Empacotar instalador
+        id: pack
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
+            Select-Object -First 1).Matches.Groups[1].Value
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $final = "dist\quarry-setup-$ver.exe"
+          Copy-Item installer\setup\target\release\quarry-setup.exe $final -Force
+          "version=$ver"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+          "setup=$final"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
 
       - name: Publicar artefato do build
         uses: actions/upload-artifact@v4
         with:
-          name: quarry-windows-x64
-          path: target/release/quarry.exe
+          name: quarry-setup-windows-x64
+          path: ${{ steps.pack.outputs.setup }}
 
-      # Assinatura Authenticode (opcional): so roda se o certificado estiver
-      # nos secrets. Assina o binario oficial para ser verificavel/distinguivel.
-      - name: Assinar binario (Authenticode, opcional)
+      # Assinatura Authenticode (opcional): so roda se o certificado estiver nos
+      # secrets. Assina o INSTALADOR oficial para ser verificavel/distinguivel.
+      - name: Assinar instalador (Authenticode, opcional)
         if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && env.CODESIGN_PFX != ''
         run: |
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:CODESIGN_PFX))
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
             Sort-Object FullName | Select-Object -Last 1
           & $signtool.FullName sign /fd SHA256 /f "$env:RUNNER_TEMP\cert.pfx" /p "$env:CODESIGN_PWD" `
-            /tr http://timestamp.digicert.com /td SHA256 target/release/quarry.exe
+            /tr http://timestamp.digicert.com /td SHA256 "${{ steps.pack.outputs.setup }}"
           Remove-Item "$env:RUNNER_TEMP\cert.pfx"
 
       # Proveniencia SLSA (keyless, via OIDC). Verificavel com:
-      #   gh attest verify quarry.exe --owner <dono-do-repo>
+      #   gh attest verify quarry-setup-<versao>.exe --owner <dono-do-repo>
       - name: Atestar proveniencia do build
         if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: target/release/quarry.exe
+          subject-path: ${{ steps.pack.outputs.setup }}
 
       - name: Gerar checksum SHA256
         if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         run: |
-          $h = (Get-FileHash target/release/quarry.exe -Algorithm SHA256).Hash.ToLower()
-          "$h  quarry.exe" | Out-File -FilePath target/release/quarry.exe.sha256 -Encoding ascii
+          $setup = "${{ steps.pack.outputs.setup }}"
+          $h = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "$h  $(Split-Path $setup -Leaf)" | Out-File -FilePath "$setup.sha256" -Encoding ascii
 
       # Cada push na branch padrao cria uma release NOVA (tag unica), sem
       # sobrescrever as anteriores; a mais recente vira a "Latest".
@@ -71,7 +104,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $ver = "${{ steps.pack.outputs.version }}"
+          $setup = "${{ steps.pack.outputs.setup }}"
           $tag = "v$ver-build.${{ github.run_number }}"
           $prev = git tag --list 'v*' --sort=-creatordate | Select-Object -First 1
           if ($prev) { $range = "$prev..HEAD" } else { $range = "HEAD" }
@@ -80,20 +114,25 @@ jobs:
           $notes = @"
           **Quarry v$ver** — build ${{ github.run_number }} ($(Get-Date -Format yyyy-MM-dd))
 
+          Instalador grafico unico: baixe o ``quarry-setup-$ver.exe`` e siga o
+          assistente (Bem-vindo -> Licenca -> Opcoes -> Instalar). Ele instala o
+          Quarry + WinDivert, cria os atalhos e registra a desinstalacao. Pede
+          elevacao (UAC) por precisar de Administrador.
+
           ### Recursos
-          - **General Exploring**: scanner de memoria, pointer scan, auto assembler, injecao de DLL
-          - **Kernel Exploring**: proxy HTTPS (Historico, Intercept, Repeater, Match & Replace)
+          - **General Exploring**: scanner de memoria, pointer scan, Memory Viewer, auto assembler, injecao de DLL, scripting (rhai), Unity/Mono
+          - **Kernel Exploring** (sem tocar no processo): proxy HTTPS (Historico/Intercept/Repeater/Match&Replace), captura passiva TCP/UDP, redirect por processo (WinDivert), APIs locais da Riot (LCU)
           - Deteccao de anticheat + roteamento Kernel/General
 
           ### Mudancas neste build
           $changes
 
           ### Verificacao
-          - Proveniencia (SLSA): ``gh attest verify quarry.exe --owner ${{ github.repository_owner }}``
-          - Checksum: confira ``quarry.exe`` contra ``quarry.exe.sha256``
+          - Proveniencia (SLSA): ``gh attest verify quarry-setup-$ver.exe --owner ${{ github.repository_owner }}``
+          - Checksum: confira o ``.exe`` contra o ``.sha256``
           "@
           $notes | Out-File -FilePath notes.md -Encoding utf8
-          gh release create $tag target/release/quarry.exe target/release/quarry.exe.sha256 `
+          gh release create $tag "$setup" "$setup.sha256" `
             --target ${{ github.sha }} `
             --title "Quarry v$ver (build ${{ github.run_number }})" `
             --notes-file notes.md `
