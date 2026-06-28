@@ -30,6 +30,8 @@ Exploring**, que funciona mesmo com anti-cheat kernel.
 | **Script** | Automação via **rhai** (Rust puro) em thread de fundo: `read_i32`/`read_f32`/`read_ptr`/`read_bytes`, `write_i32`/`write_bytes`, `module_base(nome)`, `aob_scan`/`aob_scan_module`, `print`. |
 | **Unity/Mono** | Detecta o backend de scripting (Mono vs IL2CPP vs Unity) pelos módulos e lê a **API `mono_*`** direto do PE em memória (só leitura). |
 | **Correlação** | Liga memória e rede: procura um **valor (ou bytes de um endereço)** no **tráfego capturado** por processo, sem hook nem injeção. |
+| **PE** | Análise **estática** de um `.exe`/`.dll` (ou do executável do processo anexado): cabeçalhos, arquitetura, **mitigações** (ASLR/DEP/CFG), **seções com entropia**, **imports (IAT)**, **exports (EAT)**, detecção de **.NET** e heurística de **packer/compilador**. |
+| **Processo** | Raio-X do processo: **mapa de memória** (proteção/estado/tipo + arquivo mapeado), **threads** (start address → módulo+offset), **módulos**, **linha de comando** (via PEB) e **extração de strings** (ASCII/UTF-16). |
 | **Proxy HTTPS** *(Kernel Exploring)* | Proxy de interceptação com CA própria: **Histórico**, **Intercept** (pausar/editar/forward), **Repeater** e **Match & Replace**. Não toca no processo. Veja [Proxy HTTPS](#proxy-https-kernel-exploring). |
 | **Captura passiva** *(Kernel Exploring)* | Sniffer por processo via raw socket (`SIO_RCVALL`): captura **TCP e UDP**, filtra por protocolo, disseca o cabeçalho L4 e **identifica o protocolo de aplicação** (DNS/QUIC/DTLS/STUN/RTP…). Tráfego de jogo é quase todo UDP. Estilo Wireshark, sem tocar no processo. |
 | **Redirect (WinDivert)** *(Kernel Exploring)* | **Proxifier embutido**: força o TCP de saída de um processo pelo Quarry via WinDivert — **sem injetar no jogo**. Redireciona as conexões para um listener local que faz a ponte até o destino real e lê HTTP em texto puro. Requer `WinDivert.dll`/`.sys` + Admin. |
@@ -143,6 +145,8 @@ src/
   ce_import.rs import de tabelas .CT do Cheat Engine
   script.rs    camada de scripting/automação (motor rhai)
   unity.rs     dissector Unity/Mono/IL2CPP (detecção + exports da API mono)
+  pe.rs        analisador estático de PE (headers/seções/imports/exports/packer)
+  internals.rs internals do processo (mapa de memória, threads, cmdline, strings)
 build.rs       embute ícone (.ico) + manifesto de Admin (release) no exe
 assets/        quarry.svg (fonte do ícone) + quarry.ico/quarry-256.png (gerados)
 installer/setup/  instalador gráfico (wizard egui, auto-extraível, embute tudo)
@@ -361,6 +365,19 @@ Auto Assembler. Assim o trabalho sobrevive a reinícios do jogo e do Quarry.
 - [x] Dissector de Unity/Mono/.NET — detecção do backend + leitura da API `mono_*` (só leitura)
 - [ ] Dissector: enumerar assemblies/classes/campos (requer chamar `mono_*` no alvo)
 - [x] Montador de mnemônicos x86-64 (mov/add/lea/imul/shifts/movzx/SSE/jcc; `db` só para casos raros)
+
+### 🪨 Bedrock — dissecção de software comum
+
+Linha de trabalho que leva o Quarry **além dos jogos**, para engenharia reversa e
+instrumentação de software em geral — cavar até a rocha-base do binário e do processo.
+
+- [x] Analisador de PE estático (headers, mitigações, seções+entropia, IAT/EAT, packer/.NET)
+- [x] Explorador de internals do processo (mapa de memória, threads, cmdline, strings)
+- [ ] Internals: handles + token/privilégios (fase 2 — exige NtQueryObject com timeout)
+- [ ] Hook de API inline + API Monitor (agente injetável + IPC) — *pedra angular*
+- [ ] Chamar função no alvo (invocar export com argumentos)
+- [ ] Patch-to-file (gravar patches no .exe/.dll em disco)
+- [ ] Debugger completo (breakpoints de software, step, registradores, call stack)
 
 ## Tecnologias
 
