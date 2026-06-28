@@ -9,9 +9,11 @@ mod debugger;
 mod disasm;
 mod hotkeys;
 mod inject;
+mod internals;
 mod lcu;
 mod lcu_ws;
 mod memory;
+mod pe;
 mod pointer;
 mod process;
 mod proxy;
@@ -151,6 +153,8 @@ enum Tab {
     Script,
     Unity,
     Correlacao,
+    Pe,
+    Internals,
     // --- Kernel Exploring (safe, sem injecao) ---
     Proxy,
     Capture,
@@ -169,7 +173,9 @@ impl Tab {
             | Tab::Injecao
             | Tab::Script
             | Tab::Unity
-            | Tab::Correlacao => Section::General,
+            | Tab::Correlacao
+            | Tab::Pe
+            | Tab::Internals => Section::General,
             Tab::Proxy | Tab::Capture | Tab::Redirect | Tab::Lcu | Tab::KernelOverview => {
                 Section::Kernel
             }
@@ -407,6 +413,31 @@ struct App {
     corr_addr: String,
     corr_len: String,
     corr_results: Vec<CorrHit>,
+
+    // --- aba PE (análise estática) ---
+    pe_path: String,
+    pe_info: Option<pe::PeInfo>,
+    pe_imports_filter: String,
+    pe_exports_filter: String,
+
+    // --- aba Processo (internals) ---
+    int_view: InternalsView,
+    int_mem_map: Vec<internals::MemRegion>,
+    int_threads: Vec<internals::ThreadInfo>,
+    int_modules: Vec<inject::ModuleInfo>,
+    int_cmdline: String,
+    int_strings: Vec<internals::FoundString>,
+    int_str_minlen: String,
+    int_str_filter: String,
+    int_mem_filter: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InternalsView {
+    MemMap,
+    Threads,
+    Modules,
+    Strings,
 }
 
 impl Default for App {
@@ -547,6 +578,21 @@ impl Default for App {
             corr_addr: String::new(),
             corr_len: "8".into(),
             corr_results: Vec::new(),
+
+            pe_path: String::new(),
+            pe_info: None,
+            pe_imports_filter: String::new(),
+            pe_exports_filter: String::new(),
+
+            int_view: InternalsView::MemMap,
+            int_mem_map: Vec::new(),
+            int_threads: Vec::new(),
+            int_modules: Vec::new(),
+            int_cmdline: String::new(),
+            int_strings: Vec::new(),
+            int_str_minlen: "5".into(),
+            int_str_filter: String::new(),
+            int_mem_filter: String::new(),
         }
     }
 }
@@ -1987,6 +2033,8 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.tab, Tab::Script, "Script");
                     ui.selectable_value(&mut self.tab, Tab::Unity, "Unity/Mono");
                     ui.selectable_value(&mut self.tab, Tab::Correlacao, "Correlação");
+                    ui.selectable_value(&mut self.tab, Tab::Pe, "PE");
+                    ui.selectable_value(&mut self.tab, Tab::Internals, "Processo");
                 }
                 Section::Kernel => {
                     ui.selectable_value(&mut self.tab, Tab::Proxy, "Proxy HTTPS");
@@ -2029,6 +2077,8 @@ impl eframe::App for App {
             Tab::Script => self.script_panel(ui),
             Tab::Unity => self.unity_panel(ui),
             Tab::Correlacao => self.corr_panel(ui),
+            Tab::Pe => self.pe_panel(ui),
+            Tab::Internals => self.internals_panel(ui),
             Tab::Proxy => self.proxy_panel(ui),
             Tab::Capture => self.capture_panel(ui),
             Tab::Redirect => self.redirect_panel(ui),
@@ -2169,6 +2219,22 @@ impl App {
                         "Liga o que você vê na memória ao que passa na rede: procura um valor \
                          (ou os bytes de um endereço) no tráfego capturado, por processo. \
                          Passivo e seguro — inicie antes a Captura passiva (Kernel).",
+                    );
+                    system(
+                        ui,
+                        "PE (análise estática)",
+                        "Disseca um .exe/.dll do disco (ou o executável do processo anexado): \
+                         cabeçalhos, arquitetura, mitigações (ASLR/DEP/CFG), seções com entropia, \
+                         imports (IAT), exports (EAT), detecção de .NET e heurística de \
+                         packer/compilador. Não toca em processo nenhum.",
+                    );
+                    system(
+                        ui,
+                        "Processo (internals)",
+                        "Raio-X do processo anexado: mapa de memória (proteção/estado/tipo + \
+                         arquivo mapeado), threads (com start address resolvido para módulo+offset), \
+                         módulos carregados, linha de comando (via PEB) e extração de strings \
+                         (ASCII/UTF-16). Clique num endereço para abri-lo no Memory Viewer.",
                     );
 
                     ui.add_space(8.0);
@@ -4251,6 +4317,414 @@ impl App {
                     ui.label(format!("Hex dump ({} bytes):", p.data.len()));
                     ui.monospace(hex_dump(&p.data));
                 });
+        }
+    }
+
+    fn pe_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Analisador de PE (estático)");
+        ui.label(
+            "Disseca um .exe/.dll do disco: cabeçalhos, seções (com entropia), imports (IAT), \
+             exports (EAT), detecção de .NET e heurística de packer/compilador. Não toca em \
+             processo nenhum.",
+        );
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("📂 Abrir arquivo…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Executáveis", &["exe", "dll", "sys", "ocx", "cpl"])
+                    .pick_file()
+                {
+                    self.load_pe(path);
+                }
+            }
+            if let Some(pid) = self.attached.as_ref().map(|h| h.pid) {
+                if ui.button("Analisar processo anexado").clicked() {
+                    match process::image_path(pid) {
+                        Some(path) => self.load_pe(path),
+                        None => self.status = "Não consegui obter o caminho do executável.".into(),
+                    }
+                }
+            }
+        });
+        if !self.pe_path.is_empty() {
+            ui.weak(&self.pe_path);
+        }
+
+        let Some(info) = &self.pe_info else {
+            ui.add_space(8.0);
+            ui.weak("Abra um arquivo para analisar.");
+            return;
+        };
+
+        ui.separator();
+        // --- resumo ---
+        egui::Grid::new("pe_summary")
+            .num_columns(2)
+            .spacing([12.0, 2.0])
+            .show(ui, |ui| {
+                let kind = if info.is_dll { "DLL" } else { "EXE" };
+                ui.label("Tipo / arquitetura");
+                ui.monospace(format!(
+                    "{kind} · {} ({})",
+                    info.machine_str,
+                    if info.is_64 { "64-bit" } else { "32-bit" }
+                ));
+                ui.end_row();
+                ui.label("Subsistema");
+                ui.monospace(info.subsystem_str);
+                ui.end_row();
+                ui.label("Entry point / Image base");
+                ui.monospace(format!("0x{:X} / 0x{:X}", info.entry_point, info.image_base));
+                ui.end_row();
+                ui.label("Tamanho da imagem");
+                ui.monospace(format!("{} ({} B)", human_bytes(info.size_of_image as u64), info.size_of_image));
+                ui.end_row();
+                ui.label("Timestamp");
+                ui.monospace(format!("0x{:08X}", info.timestamp));
+                ui.end_row();
+                ui.label("Mitigações");
+                ui.monospace(info.mitigations());
+                ui.end_row();
+            });
+
+        // --- veredito ---
+        ui.add_space(4.0);
+        for line in &info.verdict {
+            let color = if line.contains("packer")
+                || line.contains("entropia")
+                || line.contains("UPX")
+                || line.contains("minúscula")
+            {
+                egui::Color32::from_rgb(0xff, 0xb0, 0x4d)
+            } else {
+                egui::Color32::LIGHT_GREEN
+            };
+            ui.colored_label(color, format!("• {line}"));
+        }
+
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // --- seções ---
+            egui::CollapsingHeader::new(format!("Seções ({})", info.sections.len()))
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::Grid::new("pe_sections")
+                        .num_columns(6)
+                        .striped(true)
+                        .spacing([12.0, 3.0])
+                        .show(ui, |ui| {
+                            for h in ["Nome", "VA", "VSize", "Raw", "Flags", "Entropia"] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            for s in &info.sections {
+                                ui.monospace(&s.name);
+                                ui.monospace(format!("0x{:X}", s.vaddr));
+                                ui.monospace(format!("0x{:X}", s.vsize));
+                                ui.monospace(format!("0x{:X}", s.raw_size));
+                                ui.monospace(s.flags());
+                                let c = if s.entropy > 7.2 {
+                                    egui::Color32::from_rgb(0xff, 0xb0, 0x4d)
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                ui.colored_label(c, format!("{:.2}", s.entropy));
+                                ui.end_row();
+                            }
+                        });
+                });
+
+            // --- imports ---
+            let nfuncs: usize = info.imports.iter().map(|i| i.funcs.len()).sum();
+            egui::CollapsingHeader::new(format!(
+                "Imports ({} DLLs, {} funções)",
+                info.imports.len(),
+                nfuncs
+            ))
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.pe_imports_filter)
+                        .hint_text("filtrar dll/função")
+                        .desired_width(240.0),
+                );
+                let f = self.pe_imports_filter.to_ascii_lowercase();
+                for imp in &info.imports {
+                    let dll_match = f.is_empty() || imp.dll.to_ascii_lowercase().contains(&f);
+                    let funcs: Vec<&String> = imp
+                        .funcs
+                        .iter()
+                        .filter(|name| dll_match || name.to_ascii_lowercase().contains(&f))
+                        .collect();
+                    if f.is_empty() || dll_match || !funcs.is_empty() {
+                        egui::CollapsingHeader::new(format!("{} ({})", imp.dll, imp.funcs.len()))
+                            .id_source(&imp.dll)
+                            .show(ui, |ui| {
+                                let show = if dll_match { imp.funcs.iter().collect() } else { funcs };
+                                for fname in show {
+                                    ui.monospace(fname);
+                                }
+                            });
+                    }
+                }
+            });
+
+            // --- exports ---
+            if !info.exports.is_empty() {
+                egui::CollapsingHeader::new(format!("Exports ({})", info.exports.len())).show(
+                    ui,
+                    |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.pe_exports_filter)
+                                .hint_text("filtrar export")
+                                .desired_width(240.0),
+                        );
+                        let f = self.pe_exports_filter.to_ascii_lowercase();
+                        egui::Grid::new("pe_exports")
+                            .num_columns(3)
+                            .striped(true)
+                            .spacing([12.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.strong("Ordinal");
+                                ui.strong("RVA");
+                                ui.strong("Nome");
+                                ui.end_row();
+                                for e in &info.exports {
+                                    if !f.is_empty() && !e.name.to_ascii_lowercase().contains(&f) {
+                                        continue;
+                                    }
+                                    ui.monospace(e.ordinal.to_string());
+                                    ui.monospace(format!("0x{:X}", e.rva));
+                                    ui.monospace(&e.name);
+                                    ui.end_row();
+                                }
+                            });
+                    },
+                );
+            }
+        });
+    }
+
+    /// Lê e analisa um arquivo PE, guardando o resultado.
+    fn load_pe(&mut self, path: std::path::PathBuf) {
+        match std::fs::read(&path) {
+            Ok(bytes) => match pe::analyze(&bytes) {
+                Ok(info) => {
+                    self.pe_path = path.display().to_string();
+                    self.pe_info = Some(info);
+                    self.status = "PE analisado.".into();
+                }
+                Err(e) => {
+                    self.pe_info = None;
+                    self.status = format!("PE: {e}");
+                }
+            },
+            Err(e) => self.status = format!("Falha ao ler arquivo: {e}"),
+        }
+    }
+
+    fn internals_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Processo — internals");
+        let Some(handle) = self.attached.clone() else {
+            ui.label("Anexe um processo para inspecionar threads, memória e strings.");
+            return;
+        };
+        let pid = handle.pid;
+
+        ui.horizontal(|ui| {
+            if ui.button("🔄 Atualizar").clicked() {
+                self.int_mem_map = internals::memory_map(handle.raw());
+                self.int_modules = internals::modules(pid);
+                self.int_threads = internals::threads(pid, &self.int_modules);
+                self.int_cmdline = internals::command_line(handle.raw()).unwrap_or_default();
+                self.status = format!(
+                    "{} regiões · {} threads · {} módulos.",
+                    self.int_mem_map.len(),
+                    self.int_threads.len(),
+                    self.int_modules.len()
+                );
+            }
+            if !self.int_cmdline.is_empty() {
+                ui.separator();
+                ui.label("cmdline:");
+                ui.monospace(&self.int_cmdline);
+            }
+        });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.int_view, InternalsView::MemMap, "Mapa de memória");
+            ui.selectable_value(&mut self.int_view, InternalsView::Threads, "Threads");
+            ui.selectable_value(&mut self.int_view, InternalsView::Modules, "Módulos");
+            ui.selectable_value(&mut self.int_view, InternalsView::Strings, "Strings");
+        });
+        ui.separator();
+
+        match self.int_view {
+            InternalsView::MemMap => self.int_memmap_view(ui),
+            InternalsView::Threads => self.int_threads_view(ui),
+            InternalsView::Modules => self.int_modules_view(ui),
+            InternalsView::Strings => self.int_strings_view(ui, &handle),
+        }
+    }
+
+    fn int_memmap_view(&mut self, ui: &mut egui::Ui) {
+        if self.int_mem_map.is_empty() {
+            ui.weak("Clique em Atualizar.");
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Filtro:");
+            ui.text_edit_singleline(&mut self.int_mem_filter);
+        });
+        let f = self.int_mem_filter.to_ascii_lowercase();
+        let mut goto: Option<u64> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("int_memmap")
+                .num_columns(6)
+                .striped(true)
+                .spacing([12.0, 3.0])
+                .show(ui, |ui| {
+                    for h in ["Base", "Tamanho", "Estado", "Prot", "Tipo", "Detalhe"] {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    for r in &self.int_mem_map {
+                        if !f.is_empty()
+                            && !r.detail.to_ascii_lowercase().contains(&f)
+                            && !r.kind.contains(&f)
+                            && !format!("{:x}", r.base).contains(&f)
+                        {
+                            continue;
+                        }
+                        if ui
+                            .add(egui::Label::new(egui::RichText::new(format!("0x{:X}", r.base)).monospace())
+                                .sense(egui::Sense::click()))
+                            .on_hover_text("ver no Memory Viewer")
+                            .clicked()
+                        {
+                            goto = Some(r.base);
+                        }
+                        ui.monospace(human_bytes(r.size));
+                        ui.monospace(r.state);
+                        ui.monospace(&r.protect);
+                        ui.monospace(r.kind);
+                        ui.monospace(&r.detail);
+                        ui.end_row();
+                    }
+                });
+        });
+        if let Some(addr) = goto {
+            self.mv_addr_text = format!("{addr:X}");
+            self.tab = Tab::MemViewer;
+        }
+    }
+
+    fn int_threads_view(&mut self, ui: &mut egui::Ui) {
+        if self.int_threads.is_empty() {
+            ui.weak("Clique em Atualizar.");
+            return;
+        }
+        ui.label(format!("{} threads", self.int_threads.len()));
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("int_threads")
+                .num_columns(4)
+                .striped(true)
+                .spacing([14.0, 3.0])
+                .show(ui, |ui| {
+                    for h in ["TID", "Prio", "Start", "Símbolo"] {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    for t in &self.int_threads {
+                        ui.monospace(t.tid.to_string());
+                        ui.monospace(t.base_priority.to_string());
+                        ui.monospace(format!("0x{:X}", t.start));
+                        ui.monospace(&t.start_sym);
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn int_modules_view(&mut self, ui: &mut egui::Ui) {
+        if self.int_modules.is_empty() {
+            ui.weak("Clique em Atualizar.");
+            return;
+        }
+        ui.label(format!("{} módulos", self.int_modules.len()));
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("int_modules")
+                .num_columns(3)
+                .striped(true)
+                .spacing([14.0, 3.0])
+                .show(ui, |ui| {
+                    for h in ["Módulo", "Base", "Tamanho"] {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    for m in &self.int_modules {
+                        ui.monospace(&m.name);
+                        ui.monospace(format!("0x{:X}", m.base));
+                        ui.monospace(human_bytes(m.size as u64));
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn int_strings_view(&mut self, ui: &mut egui::Ui, handle: &Arc<OpenProcessHandle>) {
+        ui.horizontal(|ui| {
+            ui.label("Tamanho mín.:");
+            ui.add(egui::TextEdit::singleline(&mut self.int_str_minlen).desired_width(50.0));
+            if ui.button("🔎 Extrair strings").clicked() {
+                if self.int_mem_map.is_empty() {
+                    self.int_mem_map = internals::memory_map(handle.raw());
+                }
+                let min = self.int_str_minlen.trim().parse::<usize>().unwrap_or(5).max(2);
+                self.int_strings = internals::strings(handle.raw(), &self.int_mem_map, min);
+                self.status = format!("{} strings extraídas.", self.int_strings.len());
+            }
+            ui.label("Filtro:");
+            ui.text_edit_singleline(&mut self.int_str_filter);
+        });
+        if self.int_strings.is_empty() {
+            ui.weak("Extraia as strings da memória do processo.");
+            return;
+        }
+        ui.weak(format!("{} strings (máx. 20000)", self.int_strings.len()));
+        let f = self.int_str_filter.to_ascii_lowercase();
+        let mut goto: Option<u64> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("int_strings")
+                .num_columns(3)
+                .striped(true)
+                .spacing([10.0, 2.0])
+                .show(ui, |ui| {
+                    ui.strong("Endereço");
+                    ui.strong("Tipo");
+                    ui.strong("Texto");
+                    ui.end_row();
+                    for s in &self.int_strings {
+                        if !f.is_empty() && !s.text.to_ascii_lowercase().contains(&f) {
+                            continue;
+                        }
+                        if ui
+                            .add(egui::Label::new(egui::RichText::new(format!("0x{:X}", s.addr)).monospace())
+                                .sense(egui::Sense::click()))
+                            .clicked()
+                        {
+                            goto = Some(s.addr);
+                        }
+                        ui.monospace(if s.wide { "W" } else { "A" });
+                        ui.monospace(&s.text);
+                        ui.end_row();
+                    }
+                });
+        });
+        if let Some(addr) = goto {
+            self.mv_addr_text = format!("{addr:X}");
+            self.tab = Tab::MemViewer;
         }
     }
 

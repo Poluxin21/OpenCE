@@ -96,6 +96,30 @@ pub fn pointer_size(handle: HANDLE) -> usize {
     }
 }
 
+/// Caminho completo do executavel de um processo (para analise estatica do PE).
+pub fn image_path(pid: u32) -> Option<std::path::PathBuf> {
+    use windows::core::PWSTR;
+    use windows::Win32::System::Threading::{
+        QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = vec![0u16; 1024];
+        let mut size = buf.len() as u32;
+        let res = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buf.as_mut_ptr()),
+            &mut size,
+        );
+        let _ = CloseHandle(handle);
+        res.ok()?;
+        Some(std::path::PathBuf::from(String::from_utf16_lossy(
+            &buf[..size as usize],
+        )))
+    }
+}
+
 impl Drop for OpenProcessHandle {
     fn drop(&mut self) {
         unsafe {
